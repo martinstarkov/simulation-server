@@ -2,13 +2,13 @@
 
 1. Run `cargo build`
 
-# Option 1: Local Client + Local Simulator:
+## Option 1: Local Client + Local Simulator:
 
 Local Client + Simulator: 
 
 `cargo run -p sim-app --bin app -- --mode local --n-states 100`
 
-# Option 2: Local Client + Local Simulator + Remote Visualizer:
+## Option 2: Local Client + Local Simulator + Remote Visualizer:
 
 Local Client + Simulator: 
 
@@ -18,7 +18,7 @@ Remote Visualizer:
 
 `cargo run -p sim-remote-client -- --addr 127.0.0.1:60000 --command "ping" --n-states 100`
 
-# Option 3: Remote Simulator + Remote Client(s) + Remote Visualizer:
+## Option 3: Remote Simulator + Remote Client(s) + Remote Visualizer:
 
 Remote Simulator:
 
