@@ -1,0 +1,12 @@
+[package]
+name = "sim-remote-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["transport"] }
+sim-proto = { path = "../sim-proto" }

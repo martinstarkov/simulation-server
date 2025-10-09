@@ -1,0 +1,21 @@
+syntax = "proto3";
+package sim;
+
+message SimMsg {
+  oneof kind {
+    string command = 1;
+    uint64 tick   = 2;
+    string state  = 3;
+    bool shutdown = 4;
+  }
+}
+
+message Ack { bool ok = 1; }
+message Empty {}
+
+service SimulatorApi {
+  // App or remote client -> simulator
+  rpc Send(SimMsg) returns (Ack);
+  // Stream state updates from simulator
+  rpc Subscribe(Empty) returns (stream SimMsg);
+}
