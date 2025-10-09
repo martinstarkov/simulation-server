@@ -19,10 +19,12 @@ use sim_proto::pb::sim::{
     Ack, SimMsg,
 };
 
-const LEASE_TIMEOUT: Duration = Duration::from_millis(30000);
-const BARRIER_TIMEOUT: Duration = Duration::from_millis(10000);
+const LEASE_TIMEOUT: Duration = Duration::from_millis(5000); // heartbeat lease
+const BARRIER_TIMEOUT: Duration = Duration::from_millis(5000); // max wait per tick
 const ACK_TIMEOUT: Duration = Duration::from_millis(10000);
-const STEP_INTERVAL: Duration = Duration::from_millis(500);
+
+const STEP_INTERVAL: Duration = Duration::from_millis(10);
+pub const CONTROL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 struct ClientStatus {
@@ -57,8 +59,8 @@ enum Cmd {
 }
 
 enum SimMode {
-    LocalOnly,     // free-run; no special handling
-    RemoteCapable, // RC enabled or remote service: drain blocking cmds before each step
+    LocalOnly,     // channels only; no external gRPC viewer
+    RemoteCapable, // gRPC for viewers/remote; drain blocking cmds before step
 }
 
 /// Minimal simulator core with barrier + fences.
@@ -157,7 +159,10 @@ impl SimulatorCore {
         let mut interval = tokio::time::interval(STEP_INTERVAL);
 
         loop {
-            // 0) Fast-poll incoming messages into queues
+            // Keep health fresh
+            self.maintain_health();
+
+            // 0) Fast-poll incoming messages into queues/state
             while let Ok(Some(msg)) =
                 tokio::time::timeout(Duration::from_millis(1), self.cmd_rx.recv()).await
             {
@@ -166,21 +171,104 @@ impl SimulatorCore {
                 }
             }
 
-            // 1) If remote-capable, drain all blocking commands BEFORE stepping
+            // 1a) If remote-capable, drain all *fenced* commands BEFORE the step
             if matches!(self.mode, SimMode::RemoteCapable) {
                 while let Some((app, cmd)) = self.blocking_cmds.pop_front() {
-                    // apply/answer the command; responses are sent immediately
+                    //println!("[sim] applying fenced command from '{app}': {cmd}");
                     let _ = self.state_tx.send(SimMsg {
                         kind: Some(Kind::State(format!("ack:{}:{}", app, cmd))),
                     });
                 }
-                // no waiting; just ensure responses were enqueued
+            }
+
+            // 1b) Barrier: wait for StepReady(t) from healthy contributors; evict laggards
+            //     This runs in BOTH modes (LocalOnly and RemoteCapable).
+            let mut cohort = self.freeze_cohort(); // only healthy + contributes + acked tick
+
+            if !cohort.is_empty() {
+                let barrier_deadline = Instant::now() + BARRIER_TIMEOUT;
+
+                loop {
+                    // Done if all remaining members have voted StepReady(t)
+                    let all_ready = cohort.iter().all(|id| {
+                        self.clients
+                            .get(id)
+                            .and_then(|c| c.voted_tick)
+                            .map(|vt| vt == self.tick)
+                            .unwrap_or(false)
+                    });
+                    if all_ready {
+                        break;
+                    }
+
+                    // Evict on unhealthy (heartbeat lease expired) or global barrier timeout
+                    let now = Instant::now();
+                    // collect evicted for logging
+                    let mut evicted: Vec<String> = Vec::new();
+                    cohort.retain(|id| {
+                        if let Some(c) = self.clients.get(id) {
+                            let keep = c.healthy && now < barrier_deadline;
+                            if !keep {
+                                evicted.push(id.clone());
+                            }
+                            keep
+                        } else {
+                            // unknown client id -> evict
+                            evicted.push(id.clone());
+                            false
+                        }
+                    });
+                    for id in evicted {
+                        eprintln!(
+                            "[sim] evicting '{id}' from tick {} barrier (unhealthy or timed out)",
+                            self.tick
+                        );
+                    }
+
+                    if cohort.is_empty() {
+                        break;
+                    }
+
+                    // While waiting, accept arriving messages and (if remote-capable) drain any newly arrived fenced cmds
+                    tokio::select! {
+                        _ = self.notify.notified() => {},
+                        _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+                    }
+
+                    while let Ok(Some(msg)) =
+                        tokio::time::timeout(Duration::from_millis(1), self.cmd_rx.recv()).await
+                    {
+                        if let Some(cmd) = Self::to_internal(msg) {
+                            self.apply_control(cmd);
+                        }
+                    }
+                    if matches!(self.mode, SimMode::RemoteCapable) {
+                        while let Some((app, cmd)) = self.blocking_cmds.pop_front() {
+                            let _ = self.state_tx.send(SimMsg {
+                                kind: Some(Kind::State(format!("ack:{}:{}", app, cmd))),
+                            });
+                        }
+                    }
+
+                    // refresh health based on latest heartbeats
+                    self.maintain_health();
+                }
+
+                // Clear votes of the remaining cohort for the next tick
+                for id in cohort {
+                    if let Some(c) = self.clients.get_mut(&id) {
+                        c.voted_tick = None;
+                    }
+                }
             }
 
             // 2) Step on the timer
             interval.tick().await;
             self.tick += 1;
-            println!("step");
+            let current = self.tick;
+
+            println!("{current} step");
+
             let _ = self.state_tx.send(SimMsg {
                 kind: Some(Kind::State(format!("state:{}", self.tick))),
             });
@@ -190,10 +278,11 @@ impl SimulatorCore {
     fn apply_control(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::FencedCommand { app_id, cmd } => {
+                //println!("[sim] fenced command from '{app_id}': {cmd}");
                 self.blocking_cmds.push_back((app_id, cmd));
             }
             Cmd::LegacyCommand(c) => {
-                // optional: immediate non-blocking ack/log
+                // non-fenced -> optional ack/no log
                 let _ = self.state_tx.send(SimMsg {
                     kind: Some(Kind::State(format!("ack:{}", c))),
                 });
@@ -243,7 +332,7 @@ impl SimulatorCore {
                     let _ = self.state_tx.send(SimMsg {
                         kind: Some(Kind::State("shutdown".into())),
                     });
-                    // graceful stop: drop out of run loop by poisoning interval: not needed here; user stops process
+                    // graceful stop is handled by process termination in this design
                 } else {
                     let _ = self.state_tx.send(SimMsg {
                         kind: Some(Kind::State("shutdown_ignored".into())),
@@ -310,7 +399,7 @@ impl AppLink {
     }
 }
 
-/// Spawn simulator locally (channels), optionally also expose gRPC for remote clients.
+/// Spawn simulator locally (channels), optionally also expose gRPC for remote clients/viewers.
 pub async fn spawn_local(
     enable_remote_client: bool,
     rc_addr: Option<SocketAddr>,
