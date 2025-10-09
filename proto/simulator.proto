@@ -1,21 +1,36 @@
 syntax = "proto3";
 package sim;
 
-message SimMsg {
-  oneof kind {
-    string command = 1;
-    uint64 tick   = 2;
-    string state  = 3;
-    bool shutdown = 4;
-  }
+service SimulatorApi {
+  rpc Send(SimMsg) returns (Ack);
+  rpc Subscribe(Empty) returns (stream SimMsg);
 }
 
-message Ack { bool ok = 1; }
 message Empty {}
 
-service SimulatorApi {
-  // App or remote client -> simulator
-  rpc Send(SimMsg) returns (Ack);
-  // Stream state updates from simulator
-  rpc Subscribe(Empty) returns (stream SimMsg);
+message Ack { bool ok = 1; }
+
+// ---- NEW coordination messages ----
+message Register { string app_id = 1; bool contributes = 2; }
+message Heartbeat { string app_id = 1; }
+message StepReady { string app_id = 1; uint64 tick = 2; }
+message StateAck { string app_id = 1; uint64 tick = 2; }
+message Command2 { string app_id = 1; bool fence = 2; string cmd = 3; }
+
+// ---- Your existing SimMsg, extended ----
+message SimMsg {
+  oneof kind {
+    // existing
+    string  command  = 1;           // legacy, non-fenced
+    uint64  tick     = 2;           // legacy
+    string  state    = 3;           // server -> client
+    bool    shutdown = 4;
+
+    // new
+    Register  register   = 10;
+    Heartbeat heartbeat  = 11;
+    StepReady  stepready = 12;
+    StateAck   stateack  = 13;
+    Command2   cmd2      = 14;
+  }
 }

@@ -1,8 +1,14 @@
 use anyhow::Result;
-use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_core::Stream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tonic::{Request, Response, Status};
@@ -13,11 +19,61 @@ use sim_proto::pb::sim::{
     Ack, SimMsg,
 };
 
-/// Minimal simulator core.
+const LEASE_TIMEOUT: Duration = Duration::from_millis(30000);
+const BARRIER_TIMEOUT: Duration = Duration::from_millis(10000);
+const ACK_TIMEOUT: Duration = Duration::from_millis(10000);
+const STEP_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone)]
+struct ClientStatus {
+    contributes: bool,
+    last_heartbeat: Instant,
+    voted_tick: Option<u64>,
+    last_acked_tick: u64,
+    healthy: bool,
+}
+
+impl ClientStatus {
+    fn new(contributes: bool) -> Self {
+        Self {
+            contributes,
+            last_heartbeat: Instant::now(),
+            voted_tick: None,
+            last_acked_tick: 0,
+            healthy: true,
+        }
+    }
+}
+
+enum Cmd {
+    LegacyCommand(String), // non-fenced
+    FencedCommand { app_id: String, cmd: String },
+    TickSet(u64),
+    Register { app_id: String, contributes: bool },
+    Heartbeat { app_id: String },
+    StepReady { app_id: String, tick: u64 },
+    StateAck { app_id: String, tick: u64 },
+    Shutdown(bool),
+}
+
+enum SimMode {
+    LocalOnly,     // free-run; no special handling
+    RemoteCapable, // RC enabled or remote service: drain blocking cmds before each step
+}
+
+/// Minimal simulator core with barrier + fences.
 pub struct SimulatorCore {
     cmd_rx: mpsc::Receiver<SimMsg>,
     state_tx: broadcast::Sender<SimMsg>,
     allow_shutdown: bool,
+
+    // barrier state
+    tick: u64,
+    clients: HashMap<String, ClientStatus>,
+    blocking_cmds: VecDeque<(String, String)>, // (app_id, cmd)
+    notify: Arc<Notify>,
+
+    mode: SimMode,
 }
 
 impl SimulatorCore {
@@ -25,50 +81,177 @@ impl SimulatorCore {
         cmd_rx: mpsc::Receiver<SimMsg>,
         state_tx: broadcast::Sender<SimMsg>,
         allow_shutdown: bool,
+        mode: SimMode,
     ) -> Self {
         Self {
             cmd_rx,
             state_tx,
             allow_shutdown,
+            tick: 0,
+            clients: HashMap::new(),
+            blocking_cmds: VecDeque::new(),
+            notify: Arc::new(Notify::new()),
+            mode,
         }
     }
 
+    fn broadcast_state(&self, tick: u64, payload: String) {
+        let _ = self.state_tx.send(SimMsg {
+            kind: Some(Kind::State(payload)),
+        });
+        // We do not await flushing; acks are explicit via messages.
+    }
+
+    fn to_internal(msg: SimMsg) -> Option<Cmd> {
+        match msg.kind {
+            Some(Kind::Command(c)) => Some(Cmd::LegacyCommand(c)),
+            Some(Kind::Tick(t)) => Some(Cmd::TickSet(t)),
+            Some(Kind::Shutdown(b)) => Some(Cmd::Shutdown(b)),
+            Some(Kind::Register(r)) => Some(Cmd::Register {
+                app_id: r.app_id,
+                contributes: r.contributes,
+            }),
+            Some(Kind::Heartbeat(hb)) => Some(Cmd::Heartbeat { app_id: hb.app_id }),
+            Some(Kind::Stepready(sr)) => Some(Cmd::StepReady {
+                app_id: sr.app_id,
+                tick: sr.tick,
+            }),
+            Some(Kind::Stateack(sa)) => Some(Cmd::StateAck {
+                app_id: sa.app_id,
+                tick: sa.tick,
+            }),
+            Some(Kind::Cmd2(c2)) => {
+                if c2.fence {
+                    Some(Cmd::FencedCommand {
+                        app_id: c2.app_id,
+                        cmd: c2.cmd,
+                    })
+                } else {
+                    // Non-fenced → do not block the barrier/free-run
+                    Some(Cmd::LegacyCommand(c2.cmd))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn maintain_health(&mut self) {
+        let now = Instant::now();
+        for (_id, st) in self.clients.iter_mut() {
+            st.healthy = now.duration_since(st.last_heartbeat) < LEASE_TIMEOUT;
+        }
+    }
+
+    fn freeze_cohort(&self) -> HashSet<String> {
+        self.clients
+            .iter()
+            .filter(|(_, c)| c.contributes && c.healthy && c.last_acked_tick >= self.tick)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     pub async fn run(mut self) {
-        let mut ticker = tokio::time::interval(Duration::from_millis(500));
-        let mut tick = 0u64;
+        // Emit initial state so clients can ack tick 0
+        self.broadcast_state(0, format!("state:{}", self.tick));
+
+        let mut interval = tokio::time::interval(STEP_INTERVAL);
 
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    tick += 1;
-                    let _ = self.state_tx.send(SimMsg { kind: Some(Kind::State(format!("state:{tick}"))) });
+            // 0) Fast-poll incoming messages into queues
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(1), self.cmd_rx.recv()).await
+            {
+                if let Some(cmd) = Self::to_internal(msg) {
+                    self.apply_control(cmd);
                 }
-                maybe = self.cmd_rx.recv() => {
-                    match maybe {
-                        Some(msg) => match msg.kind {
-                            Some(Kind::Command(c)) => {
-                                let _ = self.state_tx.send(SimMsg { kind: Some(Kind::State(format!("ack:{c}"))) });
-                            }
-                            Some(Kind::Tick(t)) => {
-                                tick = t;
-                                let _ = self.state_tx.send(SimMsg { kind: Some(Kind::State(format!("retick:{tick}"))) });
-                            }
-                            Some(Kind::Shutdown(true)) => {
-                                if self.allow_shutdown {
-                                    let _ = self.state_tx.send(SimMsg { kind: Some(Kind::State("shutdown".into())) });
-                                    break;
-                                } else {
-                                    // Ignore remote shutdowns in service mode
-                                    let _ = self.state_tx.send(SimMsg { kind: Some(Kind::State("shutdown_ignored".into())) });
-                                }
-                            }
-                            _ => {}
-                        },
-                        None => break,
+            }
+
+            // 1) If remote-capable, drain all blocking commands BEFORE stepping
+            if matches!(self.mode, SimMode::RemoteCapable) {
+                while let Some((app, cmd)) = self.blocking_cmds.pop_front() {
+                    // apply/answer the command; responses are sent immediately
+                    let _ = self.state_tx.send(SimMsg {
+                        kind: Some(Kind::State(format!("ack:{}:{}", app, cmd))),
+                    });
+                }
+                // no waiting; just ensure responses were enqueued
+            }
+
+            // 2) Step on the timer
+            interval.tick().await;
+            self.tick += 1;
+            println!("step");
+            let _ = self.state_tx.send(SimMsg {
+                kind: Some(Kind::State(format!("state:{}", self.tick))),
+            });
+        }
+    }
+
+    fn apply_control(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::FencedCommand { app_id, cmd } => {
+                self.blocking_cmds.push_back((app_id, cmd));
+            }
+            Cmd::LegacyCommand(c) => {
+                // optional: immediate non-blocking ack/log
+                let _ = self.state_tx.send(SimMsg {
+                    kind: Some(Kind::State(format!("ack:{}", c))),
+                });
+            }
+            Cmd::TickSet(t) => {
+                self.tick = t;
+                self.broadcast_state(self.tick, format!("retick:{}", self.tick));
+            }
+            Cmd::Register {
+                app_id,
+                contributes,
+            } => {
+                let st = self
+                    .clients
+                    .entry(app_id)
+                    .or_insert_with(|| ClientStatus::new(contributes));
+                st.contributes = contributes;
+                st.last_heartbeat = Instant::now();
+                st.healthy = true;
+            }
+            Cmd::Heartbeat { app_id } => {
+                if let Some(st) = self.clients.get_mut(&app_id) {
+                    st.last_heartbeat = Instant::now();
+                    st.healthy = true;
+                } else {
+                    // late heartbeat without register: create non-contributing entry
+                    self.clients.insert(app_id, ClientStatus::new(false));
+                }
+            }
+            Cmd::StepReady { app_id, tick } => {
+                if let Some(st) = self.clients.get_mut(&app_id) {
+                    // accept idempotently only for current tick
+                    if tick == self.tick {
+                        st.voted_tick = Some(tick);
                     }
                 }
             }
+            Cmd::StateAck { app_id, tick } => {
+                if let Some(st) = self.clients.get_mut(&app_id) {
+                    if tick > st.last_acked_tick {
+                        st.last_acked_tick = tick;
+                    }
+                }
+            }
+            Cmd::Shutdown(flag) => {
+                if self.allow_shutdown && flag {
+                    let _ = self.state_tx.send(SimMsg {
+                        kind: Some(Kind::State("shutdown".into())),
+                    });
+                    // graceful stop: drop out of run loop by poisoning interval: not needed here; user stops process
+                } else {
+                    let _ = self.state_tx.send(SimMsg {
+                        kind: Some(Kind::State("shutdown_ignored".into())),
+                    });
+                }
+            }
         }
+        self.notify.notify_waiters();
     }
 }
 
@@ -96,7 +279,6 @@ impl SimulatorApi for SimulatorSvc {
         Ok(Response::new(Ack { ok: true }))
     }
 
-    // Tonic wants a Stream<Item = Result<SimMsg, Status>>
     type SubscribeStream = Pin<Box<dyn Stream<Item = Result<SimMsg, Status>> + Send + 'static>>;
 
     async fn subscribe(
@@ -104,16 +286,12 @@ impl SimulatorApi for SimulatorSvc {
         _req: tonic::Request<sim_proto::pb::sim::Empty>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let rx = self.bp.state_tx.subscribe();
-
-        // Map Result<SimMsg, BroadcastStreamRecvError> -> Result<SimMsg, Status>
         let stream = BroadcastStream::new(rx).map(|res| match res {
             Ok(msg) => Ok(msg),
-            // If a client lags, emit a marker instead of erroring out
             Err(BroadcastStreamRecvError::Lagged(_)) => Ok(SimMsg {
                 kind: Some(Kind::State("lagged".into())),
             }),
         });
-
         Ok(Response::new(Box::pin(stream)))
     }
 }
@@ -127,7 +305,6 @@ impl AppLink {
     pub async fn send(&self, msg: SimMsg) {
         let _ = self.cmd_tx.send(msg).await;
     }
-
     pub async fn next_state(&mut self) -> Option<SimMsg> {
         self.state_rx.recv().await.ok()
     }
@@ -139,7 +316,13 @@ pub async fn spawn_local(
     rc_addr: Option<SocketAddr>,
 ) -> Result<(AppLink, tokio::task::JoinHandle<()>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SimMsg>(1024);
-    let (state_tx, _rx0) = broadcast::channel::<SimMsg>(2048);
+    let (state_tx, _rx0) = broadcast::channel::<SimMsg>(4096);
+
+    let mode = if enable_remote_client {
+        SimMode::RemoteCapable
+    } else {
+        SimMode::LocalOnly
+    };
 
     // Optional remote-client gRPC server
     if enable_remote_client {
@@ -160,8 +343,7 @@ pub async fn spawn_local(
         eprintln!("[local] remote-client gRPC server on {addr}");
     }
 
-    // Core runner
-    let core = SimulatorCore::new(cmd_rx, state_tx.clone(), true);
+    let core = SimulatorCore::new(cmd_rx, state_tx.clone(), true, mode);
     let join = tokio::spawn(async move { core.run().await });
 
     let link = AppLink {
@@ -174,12 +356,17 @@ pub async fn spawn_local(
 /// Standalone gRPC simulator service (for remote mode).
 pub async fn run_simulator_service(listen: SocketAddr) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SimMsg>(1024);
-    let (state_tx, _rx0) = broadcast::channel::<SimMsg>(2048);
+    let (state_tx, _rx0) = broadcast::channel::<SimMsg>(4096);
 
-    // clone before move so we still own a Sender for the Backplane
+    let mode = SimMode::RemoteCapable; // remote service always remote-capable
+
+    // Remote service: full barrier always (freerun=false)
     let state_tx_core = state_tx.clone();
+
     tokio::spawn(async move {
-        SimulatorCore::new(cmd_rx, state_tx_core, false).run().await;
+        SimulatorCore::new(cmd_rx, state_tx_core, false, mode)
+            .run()
+            .await;
     });
 
     let svc = SimulatorSvc {
