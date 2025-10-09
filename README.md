@@ -4,7 +4,6 @@ Local Client + Local Simulator:
 
 `cargo run -p sim-app --bin app -- --mode local --n-states 1000`
 
-
 ## Option 2: Local Client + Local Simulator + Remote Visualizer:
 
 Local Client + Local Simulator: 
@@ -15,8 +14,6 @@ Remote Visualizer:
 
 Non-Blocking: `cargo run -p sim-remote-client -- --addr 127.0.0.1:60000 --n-states 1000 --app-id visualizer-1`
 Blocking: `cargo run -p sim-remote-client -- --addr 127.0.0.1:60000 --n-states 1000 --app-id visualizer-1 --blocking`
-
-
 
 ## Option 3: Remote Simulator + Remote Client(s) + Remote Visualizer:
 
