@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crossbeam::channel;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -33,9 +34,12 @@ enum CoreIn {
 }
 
 /// Minimal simulator core with a blocking step cohort and generic requests.
+
 pub struct SimulatorCore {
-    rx: mpsc::Receiver<CoreIn>,
-    tx_out: broadcast::Sender<ServerMsg>,
+    rx_local: Option<crossbeam::channel::Receiver<CoreIn>>,
+    rx_remote: tokio::sync::mpsc::Receiver<CoreIn>,
+    tx_out_local: Option<crossbeam::channel::Sender<ServerMsg>>,
+    tx_out_remote: tokio::sync::broadcast::Sender<ServerMsg>,
 
     tick: u64,
     clients: HashMap<String, ClientStatus>,
@@ -43,10 +47,17 @@ pub struct SimulatorCore {
 }
 
 impl SimulatorCore {
-    pub fn new(rx: mpsc::Receiver<CoreIn>, tx_out: broadcast::Sender<ServerMsg>) -> Self {
+    pub fn new(
+        rx_local: Option<crossbeam::channel::Receiver<CoreIn>>,
+        rx_remote: tokio::sync::mpsc::Receiver<CoreIn>,
+        tx_out_local: Option<crossbeam::channel::Sender<ServerMsg>>,
+        tx_out_remote: tokio::sync::broadcast::Sender<ServerMsg>,
+    ) -> Self {
         Self {
-            rx,
-            tx_out,
+            rx_local,
+            rx_remote,
+            tx_out_local,
+            tx_out_remote,
             tick: 0,
             clients: HashMap::new(),
             notify: Arc::new(Notify::new()),
@@ -62,22 +73,33 @@ impl SimulatorCore {
     }
 
     fn broadcast_state(&self, tick: u64) {
-        let _ = self.tx_out.send(ServerMsg {
+        let msg = ServerMsg {
             body: Some(sim_proto::pb::sim::server_msg::Body::State(State {
                 tick,
                 data: vec![],
             })),
-        });
+        };
+
+        // Local fast path (non-blocking)
+        if let Some(l) = &self.tx_out_local {
+            let _ = l.send(msg.clone());
+        }
+        // Remote broadcast (async fan-out)
+        let _ = self.tx_out_remote.send(msg);
     }
 
     fn send_ack(&self, id: u64, ok: bool, info: &str) {
-        let _ = self.tx_out.send(ServerMsg {
+        let msg = ServerMsg {
             body: Some(sim_proto::pb::sim::server_msg::Body::Ack(Ack {
                 id,
                 ok,
                 info: info.to_string(),
             })),
-        });
+        };
+        if let Some(l) = &self.tx_out_local {
+            let _ = l.send(msg.clone());
+        }
+        let _ = self.tx_out_remote.send(msg);
     }
 
     fn apply_client(&mut self, msg: ClientMsg) {
@@ -118,70 +140,104 @@ impl SimulatorCore {
         self.notify.notify_waiters();
     }
 
+    fn handle_inmsg(&mut self, inmsg: CoreIn) {
+        match inmsg {
+            CoreIn::FromClient(cm) => self.apply_client(cm),
+            CoreIn::AutoUnregister { app_id } => {
+                self.clients.remove(&app_id);
+                self.notify.notify_waiters();
+            }
+        }
+    }
+
+    async fn drain_messages(&mut self) {
+        // Drain all immediately available local messages first
+        let mut rx_local_opt = self.rx_local.take();
+
+        if let Some(ref mut rx_local) = rx_local_opt {
+            while let Ok(msg) = rx_local.try_recv() {
+                self.handle_inmsg(msg);
+            }
+        }
+
+        // Put it back
+        self.rx_local = rx_local_opt;
+
+        // Try to grab at most one remote async message
+        match tokio::time::timeout(Duration::from_millis(1), self.rx_remote.recv()).await {
+            Ok(Some(msg)) => self.handle_inmsg(msg),
+            _ => {} // timeout or channel closed — fine
+        }
+
+        // Drain any newly arrived locals again (they're cheap)
+        let mut rx_local_opt = self.rx_local.take();
+
+        if let Some(ref mut rx_local) = rx_local_opt {
+            while let Ok(msg) = rx_local.try_recv() {
+                self.handle_inmsg(msg);
+            }
+        }
+
+        // Put it back
+        self.rx_local = rx_local_opt;
+    }
+
+    async fn wait_for_cohort(&mut self, mut cohort: HashSet<String>) {
+        loop {
+            let all_ready = cohort.iter().all(|id| {
+                self.clients
+                    .get(id)
+                    .and_then(|c| c.voted_tick)
+                    .map(|vt| vt == self.tick)
+                    .unwrap_or(false)
+            });
+            if all_ready {
+                break;
+            }
+
+            cohort.retain(|id| self.clients.get(id).map(|c| c.contributes).unwrap_or(false));
+            if cohort.is_empty() {
+                break;
+            }
+
+            tokio::select! {
+                _ = self.notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+            }
+
+            self.drain_messages().await;
+        }
+    }
+
+    fn reset_votes(&mut self) {
+        for st in self.clients.values_mut() {
+            st.voted_tick = None;
+        }
+    }
+
+    async fn advance_tick(&mut self, step_timer: &mut tokio::time::Interval) {
+        step_timer.tick().await;
+        self.tick += 1;
+        println!("{} step", self.tick);
+        self.broadcast_state(self.tick);
+    }
+
     pub async fn run(mut self) {
         self.broadcast_state(self.tick);
         let mut step_timer = tokio::time::interval(STEP_INTERVAL);
 
         loop {
-            while let Ok(Some(inmsg)) =
-                tokio::time::timeout(Duration::from_millis(1), self.rx.recv()).await
-            {
-                match inmsg {
-                    CoreIn::FromClient(cm) => self.apply_client(cm),
-                    CoreIn::AutoUnregister { app_id } => {
-                        self.clients.remove(&app_id);
-                        self.notify.notify_waiters();
-                    }
-                }
-            }
+            self.drain_messages().await;
 
-            let mut cohort = self.cohort();
+            let cohort = self.cohort();
+
             if !cohort.is_empty() {
-                loop {
-                    let all_ready = cohort.iter().all(|id| {
-                        self.clients
-                            .get(id)
-                            .and_then(|c| c.voted_tick)
-                            .map(|vt| vt == self.tick)
-                            .unwrap_or(false)
-                    });
-                    if all_ready {
-                        break;
-                    }
+                self.wait_for_cohort(cohort).await;
 
-                    cohort
-                        .retain(|id| self.clients.get(id).map(|c| c.contributes).unwrap_or(false));
-                    if cohort.is_empty() {
-                        break;
-                    }
-
-                    tokio::select! {
-                        _ = self.notify.notified() => {},
-                        _ = tokio::time::sleep(Duration::from_millis(2)) => {},
-                    }
-
-                    while let Ok(Some(inmsg)) =
-                        tokio::time::timeout(Duration::from_millis(1), self.rx.recv()).await
-                    {
-                        match inmsg {
-                            CoreIn::FromClient(cm) => self.apply_client(cm),
-                            CoreIn::AutoUnregister { app_id } => {
-                                self.clients.remove(&app_id);
-                                self.notify.notify_waiters();
-                            }
-                        }
-                    }
-                }
-
-                for st in self.clients.values_mut() {
-                    st.voted_tick = None;
-                }
+                self.reset_votes();
             }
 
-            step_timer.tick().await;
-            self.tick += 1;
-            println!("{} step", self.tick);
-            self.broadcast_state(self.tick);
+            self.advance_tick(&mut step_timer).await;
         }
     }
 }
@@ -250,16 +306,18 @@ impl SimulatorApi for SimulatorSvc {
 }
 
 /// Local app link (channels).
-pub struct AppLink {
-    pub tx_in: mpsc::Sender<CoreIn>,
-    pub rx_out: broadcast::Receiver<ServerMsg>,
+
+pub struct LocalAppLink {
+    pub tx_in: channel::Sender<CoreIn>,
+    pub rx_out: channel::Receiver<ServerMsg>,
 }
-impl AppLink {
-    pub async fn send(&self, msg: ClientMsg) {
-        let _ = self.tx_in.send(CoreIn::FromClient(msg)).await;
+
+impl LocalAppLink {
+    pub fn send(&self, msg: ClientMsg) {
+        let _ = self.tx_in.send(CoreIn::FromClient(msg));
     }
-    pub async fn next(&mut self) -> Option<ServerMsg> {
-        self.rx_out.recv().await.ok()
+    pub fn next(&self) -> Option<ServerMsg> {
+        self.rx_out.recv().ok()
     }
 }
 
@@ -267,32 +325,58 @@ impl AppLink {
 pub async fn spawn_local(
     enable_remote_service: bool,
     service_addr: Option<SocketAddr>,
-) -> Result<(AppLink, tokio::task::JoinHandle<()>)> {
+) -> Result<(LocalAppLink, tokio::task::JoinHandle<()>)> {
     use tonic::transport::Server;
 
-    let (tx_in, rx_in) = mpsc::channel::<CoreIn>(1024);
-    let (tx_out, _rx0) = broadcast::channel::<ServerMsg>(4096);
+    // === Local Crossbeam channels (for your in-process app) ===
+    let (tx_in_local, rx_in_local) = crossbeam::channel::bounded::<CoreIn>(1024);
+    let (tx_out_local, rx_out_local) = crossbeam::channel::bounded::<ServerMsg>(4096);
 
-    // IMPORTANT: create the local receiver BEFORE starting the core,
-    // so the local app won't miss the initial state:0 broadcast.
-    let link = AppLink {
-        tx_in: tx_in.clone(),
-        rx_out: tx_out.subscribe(),
+    // === Optional remote (Tokio) channels for gRPC viewer ===
+    let (tx_in_remote, rx_in_remote) = tokio::sync::mpsc::channel::<CoreIn>(1024);
+    let (tx_out_remote, _) = tokio::sync::broadcast::channel::<ServerMsg>(4096);
+
+    // === Local app link (pure Crossbeam) ===
+    let link = LocalAppLink {
+        tx_in: tx_in_local.clone(),
+        rx_out: rx_out_local,
     };
 
-    // Start the core
-    let core = SimulatorCore::new(rx_in, tx_out.clone());
+    // === Simulator core ===
+    let core = if enable_remote_service {
+        // Hybrid mode: core handles both Crossbeam + Tokio
+        SimulatorCore::new(
+            Some(rx_in_local),
+            rx_in_remote,
+            Some(tx_out_local.clone()),
+            tx_out_remote.clone(),
+        )
+    } else {
+        // Local-only mode: async channels not used
+        let (_tx_in_remote_dummy, rx_in_remote_dummy) = tokio::sync::mpsc::channel::<CoreIn>(1);
+        let (tx_out_remote_dummy, _) = tokio::sync::broadcast::channel::<ServerMsg>(1);
+
+        SimulatorCore::new(
+            Some(rx_in_local),
+            rx_in_remote_dummy,
+            Some(tx_out_local.clone()),
+            tx_out_remote_dummy,
+        )
+    };
+
+    // === Spawn the simulator core ===
     let join = tokio::spawn(async move { core.run().await });
 
-    // Optional gRPC service
+    // === Optional gRPC viewer ===
     if enable_remote_service {
         let addr = service_addr.unwrap_or(([127, 0, 0, 1], 60000).into());
         let svc = SimulatorSvc {
             bp: Arc::new(Backplane {
-                tx_in: tx_in.clone(),
-                tx_out: tx_out.clone(),
+                tx_in: tx_in_remote.clone(),
+                tx_out: tx_out_remote.clone(),
             }),
         };
+
         tokio::spawn(async move {
             Server::builder()
                 .add_service(SimulatorApiServer::new(svc))
@@ -300,7 +384,8 @@ pub async fn spawn_local(
                 .await
                 .expect("gRPC service failed");
         });
-        eprintln!("[local] gRPC service on {addr}");
+
+        eprintln!("[local] gRPC viewer service on {addr}");
     }
 
     Ok((link, join))
@@ -308,23 +393,32 @@ pub async fn spawn_local(
 
 /// Standalone gRPC simulator service (for remote mode).
 pub async fn run_simulator_service(listen: SocketAddr) -> Result<()> {
-    let (tx_in, rx_in) = mpsc::channel::<CoreIn>(1024);
-    let (tx_out, _rx0) = broadcast::channel::<ServerMsg>(4096);
+    use tonic::transport::Server;
 
-    // clone for the core task so we can still use `tx_out` below
-    let tx_out_for_core = tx_out.clone();
+    let (tx_in, rx_in) = mpsc::channel::<CoreIn>(1024);
+    let (tx_out_remote, _rx0) = broadcast::channel::<ServerMsg>(4096);
+
+    // Clone BEFORE moving into the async task
+    let tx_out_for_core = tx_out_remote.clone();
+
     tokio::spawn(async move {
-        SimulatorCore::new(rx_in, tx_out_for_core).run().await;
+        SimulatorCore::new(None, rx_in, None, tx_out_for_core)
+            .run()
+            .await;
     });
 
     let svc = SimulatorSvc {
-        bp: Arc::new(Backplane { tx_in, tx_out }),
+        bp: Arc::new(Backplane {
+            tx_in,
+            tx_out: tx_out_remote, // still owned here
+        }),
     };
 
     eprintln!("[remote] simulator gRPC server on {listen}");
-    tonic::transport::Server::builder()
+    Server::builder()
         .add_service(SimulatorApiServer::new(svc))
         .serve(listen)
         .await?;
+
     Ok(())
 }

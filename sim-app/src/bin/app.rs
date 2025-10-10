@@ -56,6 +56,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// TODO: Remove async if remote viewer is false.
+
 async fn run_local(
     remote_viewer: bool,
     service_addr: SocketAddr,
@@ -63,27 +65,25 @@ async fn run_local(
     n_states: usize,
 ) -> Result<()> {
     println!("[{app_id}] starting LOCAL simulator (channels)...");
-    let (mut link, join) = spawn_local(remote_viewer, Some(service_addr)).await?;
+    let (link, join) = spawn_local(remote_viewer, Some(service_addr)).await?;
 
     // Register as a contributing client.
     link.send(ClientMsg {
         app_id: app_id.to_string(),
         body: Some(ClientMsgBody::Register(Register { contributes: true })),
-    })
-    .await;
+    });
 
     // Prime the barrier for the initial tick.
     link.send(ClientMsg {
         app_id: app_id.to_string(),
         body: Some(ClientMsgBody::StepReady(StepReady { tick: 0 })),
-    })
-    .await;
+    });
 
     let mut processed = 0usize;
     let mut last_tick: u64 = 0;
 
     while processed < n_states {
-        if let Some(ServerMsg { body: Some(body) }) = link.next().await {
+        if let Some(ServerMsg { body: Some(body) }) = link.next() {
             if let ServerMsgBody::State(state) = body {
                 let t = state.tick;
                 if t > last_tick {
@@ -95,8 +95,7 @@ async fn run_local(
                     link.send(ClientMsg {
                         app_id: app_id.to_string(),
                         body: Some(ClientMsgBody::StepReady(StepReady { tick: t })),
-                    })
-                    .await;
+                    });
 
                     processed += 1;
                 }
@@ -108,7 +107,7 @@ async fn run_local(
 
     println!("[{app_id}] local session done.");
     drop(link);
-    let _ = join.await;
+    let _ = join;
     Ok(())
 }
 
