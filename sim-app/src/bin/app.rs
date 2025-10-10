@@ -1,15 +1,20 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use sim_app::{spawn_local, CONTROL_INTERVAL, STATE_WAIT_INTERVAL, STEP_INTERVAL};
+use sim_app::{
+    spawn_local, spawn_local_with_service, LocalAppLink, CONTROL_INTERVAL, STATE_WAIT_INTERVAL,
+};
 use sim_proto::pb::sim::{ClientMsg, ClientMsgBody, Register, ServerMsg, ServerMsgBody, StepReady};
 use std::net::SocketAddr;
+use std::thread;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 #[derive(ValueEnum, Clone)]
 enum Mode {
     Local,
+    Hybrid,
     Remote,
 }
 
@@ -37,36 +42,50 @@ struct Args {
     n_states: usize,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-
-    match args.mode {
-        Mode::Local => {
-            run_local(
-                args.remote_viewer,
-                args.addr.parse()?,
-                &args.app_id,
-                args.n_states,
-            )
-            .await?
-        }
-        Mode::Remote => run_remote(args.addr.parse()?, &args.app_id, args.n_states).await?,
+async fn run_local_session(
+    link: LocalAppLink,
+    join: tokio::task::JoinHandle<()>,
+    app_id: &str,
+    n_states: usize,
+) -> Result<()> {
+    run_local(link, app_id, n_states)?;
+    tokio::select! {
+        _ = join => eprintln!("[Local] Simulator exited."),
+        _ = tokio::signal::ctrl_c() => eprintln!("[Local] Interrupted.")
     }
     Ok(())
 }
 
-// TODO: Remove async if remote viewer is false.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
 
-async fn run_local(
-    remote_viewer: bool,
-    service_addr: SocketAddr,
-    app_id: &str,
-    n_states: usize,
-) -> Result<()> {
-    println!("[{app_id}] starting LOCAL simulator (channels)...");
-    let (link, join) = spawn_local(remote_viewer, Some(service_addr)).await?;
+    let id = &args.app_id;
 
+    match args.mode {
+        Mode::Local => {
+            println!("[{id}] starting local simulator (local channels)...");
+            let (link, join) = spawn_local()?;
+            run_local_session(link, join, id, args.n_states).await?;
+        }
+        Mode::Hybrid => {
+            let addr = args.addr.parse()?;
+            println!(
+                "[{id}] starting hybrid simulator (local channels with gRPC service at {addr})..."
+            );
+            let (link, join) = spawn_local_with_service(addr).await?;
+            run_local_session(link, join, id, args.n_states).await?;
+        }
+        Mode::Remote => {
+            let addr = args.addr.parse()?;
+            println!("[{id}] connecting to remote simulator at {addr}...");
+            run_remote(addr, id, args.n_states).await?
+        }
+    }
+    Ok(())
+}
+
+fn run_local(link: LocalAppLink, app_id: &str, n_states: usize) -> Result<()> {
     // Register as a contributing client.
     link.send(ClientMsg {
         app_id: app_id.to_string(),
@@ -89,7 +108,8 @@ async fn run_local(
                 if t > last_tick {
                     last_tick = t;
 
-                    tokio::time::sleep(CONTROL_INTERVAL).await;
+                    thread::sleep(CONTROL_INTERVAL);
+
                     println!("{t} thruster values found");
 
                     link.send(ClientMsg {
@@ -107,14 +127,12 @@ async fn run_local(
 
     println!("[{app_id}] local session done.");
     drop(link);
-    let _ = join;
+
     Ok(())
 }
 
 async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<()> {
     use sim_proto::pb::sim::simulator_api_client::SimulatorApiClient;
-
-    println!("[{app_id}] connecting to REMOTE simulator at {addr}...");
     let mut client = SimulatorApiClient::connect(format!("http://{addr}")).await?;
 
     // set up client->server stream
@@ -124,7 +142,7 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
     // start bidi stream
     let mut rx = client.link(outbound).await?.into_inner();
 
-    // Register as contributing
+    // Register as contributing client.
     tx_req
         .send(ClientMsg {
             app_id: app_id.into(),
@@ -132,7 +150,7 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
         })
         .await?;
 
-    // NEW: prime the barrier for the initial tick
+    // Prime the barrier for the initial tick.
     tx_req
         .send(ClientMsg {
             app_id: app_id.into(),

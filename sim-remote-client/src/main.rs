@@ -56,17 +56,17 @@ async fn main() -> Result<()> {
         })
         .await?;
 
-    // Optional: send a sample data-bearing command
-    tx_req
-        .send(ClientMsg {
-            app_id: args.app_id.clone(),
-            body: Some(client_msg::Body::Request(Request {
-                id: 1,
-                name: "set-thrust".into(),
-                data: vec![1, 2, 3, 4],
-            })),
-        })
-        .await?;
+    // // Optional: send a sample data-bearing command
+    // tx_req
+    //     .send(ClientMsg {
+    //         app_id: args.app_id.clone(),
+    //         body: Some(client_msg::Body::Request(Request {
+    //             id: 1,
+    //             name: "set-thrust".into(),
+    //             data: vec![1, 2, 3, 4],
+    //         })),
+    //     })
+    //     .await?;
 
     if args.blocking {
         // -------- BLOCKING MODE --------

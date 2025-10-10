@@ -28,7 +28,7 @@ struct ClientStatus {
     voted_tick: Option<u64>,
 }
 
-enum CoreIn {
+pub enum CoreIn {
     FromClient(ClientMsg),
     AutoUnregister { app_id: String },
 }
@@ -36,10 +36,13 @@ enum CoreIn {
 /// Minimal simulator core with a blocking step cohort and generic requests.
 
 pub struct SimulatorCore {
-    rx_local: Option<crossbeam::channel::Receiver<CoreIn>>,
-    rx_remote: tokio::sync::mpsc::Receiver<CoreIn>,
-    tx_out_local: Option<crossbeam::channel::Sender<ServerMsg>>,
-    tx_out_remote: tokio::sync::broadcast::Sender<ServerMsg>,
+    // Optional local (crossbeam) input/output
+    rx_local: Option<channel::Receiver<CoreIn>>,
+    tx_out_local: Option<channel::Sender<ServerMsg>>,
+
+    // Optional remote (Tokio) input/output
+    rx_remote: Option<mpsc::Receiver<CoreIn>>,
+    tx_out_remote: Option<broadcast::Sender<ServerMsg>>,
 
     tick: u64,
     clients: HashMap<String, ClientStatus>,
@@ -48,10 +51,10 @@ pub struct SimulatorCore {
 
 impl SimulatorCore {
     pub fn new(
-        rx_local: Option<crossbeam::channel::Receiver<CoreIn>>,
-        rx_remote: tokio::sync::mpsc::Receiver<CoreIn>,
-        tx_out_local: Option<crossbeam::channel::Sender<ServerMsg>>,
-        tx_out_remote: tokio::sync::broadcast::Sender<ServerMsg>,
+        rx_local: Option<channel::Receiver<CoreIn>>,
+        rx_remote: Option<mpsc::Receiver<CoreIn>>,
+        tx_out_local: Option<channel::Sender<ServerMsg>>,
+        tx_out_remote: Option<broadcast::Sender<ServerMsg>>,
     ) -> Self {
         Self {
             rx_local,
@@ -84,8 +87,11 @@ impl SimulatorCore {
         if let Some(l) = &self.tx_out_local {
             let _ = l.send(msg.clone());
         }
-        // Remote broadcast (async fan-out)
-        let _ = self.tx_out_remote.send(msg);
+
+        // Remote broadcast (async fan-out).
+        if let Some(l) = &self.tx_out_remote {
+            let _ = l.send(msg);
+        }
     }
 
     fn send_ack(&self, id: u64, ok: bool, info: &str) {
@@ -99,7 +105,9 @@ impl SimulatorCore {
         if let Some(l) = &self.tx_out_local {
             let _ = l.send(msg.clone());
         }
-        let _ = self.tx_out_remote.send(msg);
+        if let Some(l) = &self.tx_out_remote {
+            let _ = l.send(msg);
+        }
     }
 
     fn apply_client(&mut self, msg: ClientMsg) {
@@ -164,9 +172,11 @@ impl SimulatorCore {
         self.rx_local = rx_local_opt;
 
         // Try to grab at most one remote async message
-        match tokio::time::timeout(Duration::from_millis(1), self.rx_remote.recv()).await {
-            Ok(Some(msg)) => self.handle_inmsg(msg),
-            _ => {} // timeout or channel closed — fine
+        if let Some(rx_remote) = &mut self.rx_remote {
+            match tokio::time::timeout(Duration::from_millis(1), rx_remote.recv()).await {
+                Ok(Some(msg)) => self.handle_inmsg(msg),
+                _ => {} // timeout or channel closed — fine
+            }
         }
 
         // Drain any newly arrived locals again (they're cheap)
@@ -264,7 +274,7 @@ impl SimulatorApi for SimulatorSvc {
         let mut inbound = req.into_inner();
 
         let rx = self.bp.tx_out.subscribe();
-        let mut out_stream = BroadcastStream::new(rx).map(|res| match res {
+        let out_stream = BroadcastStream::new(rx).map(|res| match res {
             Ok(msg) => Ok(msg),
             Err(_lag) => Ok(ServerMsg {
                 body: Some(sim_proto::pb::sim::server_msg::Body::State(State {
@@ -321,104 +331,127 @@ impl LocalAppLink {
     }
 }
 
-/// Spawn simulator locally (channels), optionally also expose gRPC for remote viewers/clients.
-pub async fn spawn_local(
-    enable_remote_service: bool,
-    service_addr: Option<SocketAddr>,
-) -> Result<(LocalAppLink, tokio::task::JoinHandle<()>)> {
+fn make_local_channels() -> (
+    crossbeam::channel::Sender<CoreIn>,
+    crossbeam::channel::Receiver<CoreIn>,
+    crossbeam::channel::Sender<ServerMsg>,
+    crossbeam::channel::Receiver<ServerMsg>,
+) {
+    use crossbeam::channel;
+    let (tx_in, rx_in) = channel::bounded::<CoreIn>(1024);
+    let (tx_out, rx_out) = channel::bounded::<ServerMsg>(4096);
+    (tx_in, rx_in, tx_out, rx_out)
+}
+
+fn make_remote_channels() -> (
+    tokio::sync::mpsc::Sender<CoreIn>,
+    tokio::sync::mpsc::Receiver<CoreIn>,
+    tokio::sync::broadcast::Sender<ServerMsg>,
+) {
+    use tokio::sync::{broadcast, mpsc};
+    let (tx_in, rx_in) = mpsc::channel::<CoreIn>(1024);
+    let (tx_out, _) = broadcast::channel::<ServerMsg>(4096);
+    (tx_in, rx_in, tx_out)
+}
+
+fn start_simulator_core(core: SimulatorCore) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { core.run().await })
+}
+
+async fn start_remote_service(
+    addr: SocketAddr,
+    tx_in: tokio::sync::mpsc::Sender<CoreIn>,
+    tx_out: tokio::sync::broadcast::Sender<ServerMsg>,
+) -> Result<()> {
     use tonic::transport::Server;
 
-    // === Local Crossbeam channels (for your in-process app) ===
-    let (tx_in_local, rx_in_local) = crossbeam::channel::bounded::<CoreIn>(1024);
-    let (tx_out_local, rx_out_local) = crossbeam::channel::bounded::<ServerMsg>(4096);
+    let svc = SimulatorSvc {
+        bp: Arc::new(Backplane { tx_in, tx_out }),
+    };
 
-    // === Optional remote (Tokio) channels for gRPC viewer ===
-    let (tx_in_remote, rx_in_remote) = tokio::sync::mpsc::channel::<CoreIn>(1024);
-    let (tx_out_remote, _) = tokio::sync::broadcast::channel::<ServerMsg>(4096);
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(SimulatorApiServer::new(svc))
+            .serve(addr)
+            .await
+            .expect("gRPC service failed");
+    });
 
-    // === Local app link (pure Crossbeam) ===
+    eprintln!("[service] gRPC remote service started on {addr}");
+    Ok(())
+}
+
+/// Spawn a simulator locally using only in-process (Crossbeam) channels.
+/// Fastest configuration; no remote gRPC service is started.
+pub fn spawn_local() -> Result<(LocalAppLink, tokio::task::JoinHandle<()>)> {
+    // Local channels only
+    let (tx_in_local, rx_in_local, tx_out_local, rx_out_local) = make_local_channels();
+
+    // Local app link
     let link = LocalAppLink {
         tx_in: tx_in_local.clone(),
         rx_out: rx_out_local,
     };
 
-    // === Simulator core ===
-    let core = if enable_remote_service {
-        // Hybrid mode: core handles both Crossbeam + Tokio
-        SimulatorCore::new(
-            Some(rx_in_local),
-            rx_in_remote,
-            Some(tx_out_local.clone()),
-            tx_out_remote.clone(),
-        )
-    } else {
-        // Local-only mode: async channels not used
-        let (_tx_in_remote_dummy, rx_in_remote_dummy) = tokio::sync::mpsc::channel::<CoreIn>(1);
-        let (tx_out_remote_dummy, _) = tokio::sync::broadcast::channel::<ServerMsg>(1);
+    // Core: local only
+    let core = SimulatorCore::new(Some(rx_in_local), None, Some(tx_out_local.clone()), None);
 
-        SimulatorCore::new(
-            Some(rx_in_local),
-            rx_in_remote_dummy,
-            Some(tx_out_local.clone()),
-            tx_out_remote_dummy,
-        )
+    // Start the core
+    let join = start_simulator_core(core);
+
+    Ok((link, join))
+}
+
+/// Spawn a simulator locally with both in-process (Crossbeam) channels
+/// and a gRPC remote service endpoint for external viewers/clients.
+pub async fn spawn_local_with_service(
+    service_addr: SocketAddr,
+) -> Result<(LocalAppLink, tokio::task::JoinHandle<()>)> {
+    // Local + remote channels
+    let (tx_in_local, rx_in_local, tx_out_local, rx_out_local) = make_local_channels();
+    let (tx_in_remote, rx_in_remote, tx_out_remote) = make_remote_channels();
+
+    // Local app link
+    let link = LocalAppLink {
+        tx_in: tx_in_local.clone(),
+        rx_out: rx_out_local,
     };
 
-    // === Spawn the simulator core ===
-    let join = tokio::spawn(async move { core.run().await });
+    // Hybrid core (handles both)
+    let core = SimulatorCore::new(
+        Some(rx_in_local),
+        Some(rx_in_remote),
+        Some(tx_out_local.clone()),
+        Some(tx_out_remote.clone()),
+    );
 
-    // === Optional gRPC viewer ===
-    if enable_remote_service {
-        let addr = service_addr.unwrap_or(([127, 0, 0, 1], 60000).into());
-        let svc = SimulatorSvc {
-            bp: Arc::new(Backplane {
-                tx_in: tx_in_remote.clone(),
-                tx_out: tx_out_remote.clone(),
-            }),
-        };
+    // Spawn the simulator core
+    let join = start_simulator_core(core);
 
-        tokio::spawn(async move {
-            Server::builder()
-                .add_service(SimulatorApiServer::new(svc))
-                .serve(addr)
-                .await
-                .expect("gRPC service failed");
-        });
-
-        eprintln!("[local] gRPC viewer service on {addr}");
-    }
+    // Start remote gRPC service
+    start_remote_service(service_addr, tx_in_remote.clone(), tx_out_remote.clone()).await?;
 
     Ok((link, join))
 }
 
 /// Standalone gRPC simulator service (for remote mode).
 pub async fn run_simulator_service(listen: SocketAddr) -> Result<()> {
-    use tonic::transport::Server;
+    // === Remote-only channels ===
+    let (tx_in_remote, rx_in_remote, tx_out_remote) = make_remote_channels();
 
-    let (tx_in, rx_in) = mpsc::channel::<CoreIn>(1024);
-    let (tx_out_remote, _rx0) = broadcast::channel::<ServerMsg>(4096);
-
-    // Clone BEFORE moving into the async task
+    // === Spawn the simulator core ===
     let tx_out_for_core = tx_out_remote.clone();
+    let core = SimulatorCore::new(None, Some(rx_in_remote), None, Some(tx_out_for_core));
 
-    tokio::spawn(async move {
-        SimulatorCore::new(None, rx_in, None, tx_out_for_core)
-            .run()
-            .await;
-    });
+    let join = start_simulator_core(core);
 
-    let svc = SimulatorSvc {
-        bp: Arc::new(Backplane {
-            tx_in,
-            tx_out: tx_out_remote, // still owned here
-        }),
-    };
+    // === Start gRPC service ===
+    start_remote_service(listen, tx_in_remote, tx_out_remote).await?;
 
-    eprintln!("[remote] simulator gRPC server on {listen}");
-    Server::builder()
-        .add_service(SimulatorApiServer::new(svc))
-        .serve(listen)
-        .await?;
+    tokio::select! {
+        _ = join => eprintln!("[Remote] Simulator exited."),
+        _ = tokio::signal::ctrl_c() => eprintln!("[Remote] Interrupted.")
+    }
 
     Ok(())
 }
