@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use sim_proto::pb::sim::{
-    client_msg::Body as CBody, server_msg::Body as SBody, simulator_api_client::SimulatorApiClient,
-    ClientMsg, Register, Request, ServerMsg, StepReady,
+    client_msg, server_msg, simulator_api_client::SimulatorApiClient, ClientMsg, Register, Request,
+    ServerMsg, StepReady,
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     tx_req
         .send(ClientMsg {
             app_id: args.app_id.clone(),
-            body: Some(CBody::Register(Register {
+            body: Some(client_msg::Body::Register(Register {
                 contributes: args.blocking,
             })),
         })
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     tx_req
         .send(ClientMsg {
             app_id: args.app_id.clone(),
-            body: Some(CBody::Request(Request {
+            body: Some(client_msg::Body::Request(Request {
                 id: 1,
                 name: "set-thrust".into(),
                 data: vec![1, 2, 3, 4],
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         while count < args.n_states {
             match tokio::time::timeout(STATE_WAIT_INTERVAL, rx.next()).await {
                 Ok(Some(Ok(ServerMsg { body: Some(body) }))) => match body {
-                    SBody::State(s) => {
+                    server_msg::Body::State(s) => {
                         let t = s.tick;
                         if t <= last_tick_seen {
                             continue;
@@ -90,17 +90,17 @@ async fn main() -> Result<()> {
                         tx_req
                             .send(ClientMsg {
                                 app_id: args.app_id.clone(),
-                                body: Some(CBody::StepReady(StepReady { tick: t })),
+                                body: Some(client_msg::Body::StepReady(StepReady { tick: t })),
                             })
                             .await?;
 
                         println!("{t} viewer (blocking)"); // prints every tick (cohort member)
                         count += 1;
                     }
-                    SBody::Ack(a) => {
+                    server_msg::Body::Ack(a) => {
                         println!("ack id={} ok={} info='{}'", a.id, a.ok, a.info);
                     }
-                    SBody::Response(_r) => { /* ignore for now */ }
+                    server_msg::Body::Response(_r) => { /* ignore for now */ }
                 },
                 Ok(Some(Ok(ServerMsg { body: None }))) => {
                     // ignore empty bodies
@@ -128,15 +128,15 @@ async fn main() -> Result<()> {
             while let Some(item) = rx.next().await {
                 match item {
                     Ok(ServerMsg {
-                        body: Some(SBody::State(s)),
+                        body: Some(server_msg::Body::State(s)),
                     }) => {
                         let _ = latest_tx.send(s.tick); // only latest matters
                     }
                     Ok(ServerMsg {
-                        body: Some(SBody::Ack(_)),
+                        body: Some(server_msg::Body::Ack(_)),
                     }) => { /* ignore */ }
                     Ok(ServerMsg {
-                        body: Some(SBody::Response(_)),
+                        body: Some(server_msg::Body::Response(_)),
                     }) => { /* ignore */ }
                     Ok(ServerMsg { body: None }) => { /* ignore */ }
                     Err(_status) => break, // stream error -> stop updating

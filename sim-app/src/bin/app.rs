@@ -1,9 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use sim_app::{spawn_local, CONTROL_INTERVAL, STATE_WAIT_INTERVAL, STEP_INTERVAL};
-use sim_proto::pb::sim::{
-    client_msg::Body as CBody, server_msg::Body as SBody, ClientMsg, Register, ServerMsg, StepReady,
-};
+use sim_proto::pb::sim::{ClientMsg, ClientMsgBody, Register, ServerMsg, ServerMsgBody, StepReady};
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -67,17 +65,17 @@ async fn run_local(
     println!("[{app_id}] starting LOCAL simulator (channels)...");
     let (mut link, join) = spawn_local(remote_viewer, Some(service_addr)).await?;
 
-    // Register as a contributing client
+    // Register as a contributing client.
     link.send(ClientMsg {
         app_id: app_id.to_string(),
-        body: Some(CBody::Register(Register { contributes: true })),
+        body: Some(ClientMsgBody::Register(Register { contributes: true })),
     })
     .await;
 
-    // NEW: prime the barrier for the initial tick
+    // Prime the barrier for the initial tick.
     link.send(ClientMsg {
         app_id: app_id.to_string(),
-        body: Some(CBody::StepReady(StepReady { tick: 0 })),
+        body: Some(ClientMsgBody::StepReady(StepReady { tick: 0 })),
     })
     .await;
 
@@ -86,7 +84,7 @@ async fn run_local(
 
     while processed < n_states {
         if let Some(ServerMsg { body: Some(body) }) = link.next().await {
-            if let SBody::State(state) = body {
+            if let ServerMsgBody::State(state) = body {
                 let t = state.tick;
                 if t > last_tick {
                     last_tick = t;
@@ -96,7 +94,7 @@ async fn run_local(
 
                     link.send(ClientMsg {
                         app_id: app_id.to_string(),
-                        body: Some(CBody::StepReady(StepReady { tick: t })),
+                        body: Some(ClientMsgBody::StepReady(StepReady { tick: t })),
                     })
                     .await;
 
@@ -131,7 +129,7 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
     tx_req
         .send(ClientMsg {
             app_id: app_id.into(),
-            body: Some(CBody::Register(Register { contributes: true })),
+            body: Some(ClientMsgBody::Register(Register { contributes: true })),
         })
         .await?;
 
@@ -139,7 +137,7 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
     tx_req
         .send(ClientMsg {
             app_id: app_id.into(),
-            body: Some(CBody::StepReady(StepReady { tick: 0 })),
+            body: Some(ClientMsgBody::StepReady(StepReady { tick: 0 })),
         })
         .await?;
 
@@ -149,7 +147,7 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
     while processed < n_states {
         match tokio::time::timeout(STATE_WAIT_INTERVAL, rx.next()).await {
             Ok(Some(Ok(ServerMsg {
-                body: Some(SBody::State(s)),
+                body: Some(ServerMsgBody::State(s)),
             }))) => {
                 let t = s.tick;
                 if t > last_tick {
@@ -161,7 +159,7 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
                     tx_req
                         .send(ClientMsg {
                             app_id: app_id.into(),
-                            body: Some(CBody::StepReady(StepReady { tick: t })),
+                            body: Some(ClientMsgBody::StepReady(StepReady { tick: t })),
                         })
                         .await?;
 
