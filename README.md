@@ -28,6 +28,8 @@ Build everything:
 
 ```bash
 cargo build --workspace
+```
+
 ---
 
 ## 🧠 Modes and Usage
@@ -96,6 +98,7 @@ Waits for all states to be processed before exiting.
 
 ```bash
 cargo run -p sim-remote-client -- --addr 127.0.0.1:60000 --n-states 1000 --app-id visualizer-1 --blocking
+```
 
 ## 🧑‍💻 Clients
 
@@ -134,17 +137,17 @@ cargo run -p sim-app --bin app -- --mode remote --addr 127.0.0.1:60000 --n-state
 
 ```mermaid
 flowchart TD
-    subgraph Local
-        A[Local Client] -->|Crossbeam| B[SimulatorCore]
+    subgraph Remote
+        F[Remote Simulator] <-->|gRPC| G[Remote Visualizer / Remote Clients]
     end
 
     subgraph Hybrid
-        C[Local Client] -->|Crossbeam| D[SimulatorCore]
-        D -->|gRPC| E[Remote Visualizer / Remote Clients]
+        C[Local Client] <-->|Crossbeam| D[Local Simulator]
+        D <-->|gRPC| E[Remote Visualizer / Remote Clients]
     end
 
-    subgraph Remote
-        F[Remote Clients / Visualizer] -->|gRPC| G[Simulator Service]
+    subgraph Local
+        A[Local Client] <-->|Crossbeam| B[Local Simulator]
     end
 ```
 
