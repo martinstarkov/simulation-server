@@ -1,157 +1,189 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use sim_app::spawn_local;
-use sim_proto::pb::sim::{sim_msg::Kind, simulator_api_client::SimulatorApiClient, Empty, SimMsg};
-use std::{net::SocketAddr, time::Duration};
+use sim_app::{
+    spawn_local, spawn_local_with_service, LocalAppLink, CONTROL_INTERVAL, STATE_WAIT_INTERVAL,
+};
+use sim_proto::pb::sim::{ClientMsg, ClientMsgBody, Register, ServerMsg, ServerMsgBody, StepReady};
+use std::net::SocketAddr;
+use std::thread;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 #[derive(ValueEnum, Clone)]
 enum Mode {
     Local,
+    Hybrid,
     Remote,
 }
 
 #[derive(Parser)]
 struct Args {
-    /// local = channels, remote = gRPC
+    /// local = channels; remote = gRPC to remote simulator
     #[arg(long, value_enum, default_value = "local")]
     mode: Mode,
 
     /// Address of remote simulator service (for --mode remote)
-    /// OR remote-client port (for local rc)
+    /// OR local viewer service port (when --remote-viewer)
     #[arg(long, default_value = "127.0.0.1:50051")]
     addr: String,
 
-    /// When local, also expose a gRPC server so a remote client can connect.
-    #[arg(long, default_value_t = false)]
-    enable_rc: bool,
+    /// When local, also expose a gRPC service so a remote viewer/client can connect.
+    #[arg(long = "remote-viewer", default_value_t = false)]
+    remote_viewer: bool,
 
     /// Identifier printed alongside all app logs/states
     #[arg(long, default_value = "app-1")]
     app_id: String,
 
-    /// How many state messages the app should print before stopping (or, in rc-mode, before idling)
+    /// How many states to process before exiting
     #[arg(long = "n-states", default_value_t = 5)]
     n_states: usize,
+}
+
+async fn run_local_session(
+    link: LocalAppLink,
+    join: tokio::task::JoinHandle<()>,
+    app_id: &str,
+    n_states: usize,
+) -> Result<()> {
+    run_local(link, app_id, n_states)?;
+    tokio::select! {
+        _ = join => eprintln!("[Local] Simulator exited."),
+        _ = tokio::signal::ctrl_c() => eprintln!("[Local] Interrupted.")
+    }
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    let id = &args.app_id;
+
     match args.mode {
         Mode::Local => {
-            run_local(
-                args.enable_rc,
-                args.addr.parse()?,
-                &args.app_id,
-                args.n_states,
-            )
-            .await?
+            println!("[{id}] starting local simulator (local channels)...");
+            let (link, join) = spawn_local()?;
+            run_local_session(link, join, id, args.n_states).await?;
         }
-        Mode::Remote => run_remote(args.addr.parse()?, &args.app_id, args.n_states).await?,
+        Mode::Hybrid => {
+            let addr = args.addr.parse()?;
+            println!(
+                "[{id}] starting hybrid simulator (local channels with gRPC service at {addr})..."
+            );
+            let (link, join) = spawn_local_with_service(addr).await?;
+            run_local_session(link, join, id, args.n_states).await?;
+        }
+        Mode::Remote => {
+            let addr = args.addr.parse()?;
+            println!("[{id}] connecting to remote simulator at {addr}...");
+            run_remote(addr, id, args.n_states).await?
+        }
     }
     Ok(())
 }
 
-async fn run_local(
-    enable_rc: bool,
-    rc_addr: SocketAddr,
-    app_id: &str,
-    n_states: usize,
-) -> Result<()> {
-    println!("[{app_id}] starting LOCAL simulator (channels)...");
-    let (mut link, join) = spawn_local(enable_rc, Some(rc_addr)).await?;
+fn run_local(link: LocalAppLink, app_id: &str, n_states: usize) -> Result<()> {
+    // Register as a contributing client.
+    link.send(ClientMsg {
+        app_id: app_id.to_string(),
+        body: Some(ClientMsgBody::Register(Register { contributes: true })),
+    });
 
-    // Kick some initial activity so subscribers see something
-    link.send(SimMsg {
-        kind: Some(Kind::Command(format!("init-from-{app_id}"))),
-    })
-    .await;
-    link.send(SimMsg {
-        kind: Some(Kind::Tick(0)),
-    })
-    .await;
+    // Prime the barrier for the initial tick.
+    link.send(ClientMsg {
+        app_id: app_id.to_string(),
+        body: Some(ClientMsgBody::StepReady(StepReady { tick: 0 })),
+    });
 
-    if enable_rc {
-        println!("[{app_id}] remote-client gRPC listening at {rc_addr}");
-        if n_states > 0 {
-            // read N states on a small task, then stop reading; app stays alive for remote clients
-            let mut rx = link.state_rx.resubscribe(); // take a receiver clone
-            let id = app_id.to_string();
-            tokio::spawn(async move {
-                let mut count = 0usize;
-                while count < n_states {
-                    match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                        Ok(Ok(msg)) => {
-                            if let Some(Kind::State(s)) = msg.kind {
-                                println!("[{id}] state: {s}");
-                                count += 1;
-                            }
-                        }
-                        Ok(Err(_closed)) => break, // channel gone
-                        Err(_elapsed) => break,    // no states in window
-                    }
+    let mut processed = 0usize;
+    let mut last_tick: u64 = 0;
+
+    while processed < n_states {
+        if let Some(ServerMsg { body: Some(body) }) = link.next() {
+            if let ServerMsgBody::State(state) = body {
+                let t = state.tick;
+                if t > last_tick {
+                    last_tick = t;
+
+                    thread::sleep(CONTROL_INTERVAL);
+
+                    println!("{t} thruster values found");
+
+                    link.send(ClientMsg {
+                        app_id: app_id.to_string(),
+                        body: Some(ClientMsgBody::StepReady(StepReady { tick: t })),
+                    });
+
+                    processed += 1;
                 }
-                println!("[{id}] printed {count}/{n_states} states; now idling for remote clients (Ctrl+C to stop).");
-            });
-        } else {
-            println!("[{app_id}] not printing states (n-states=0); idling for remote clients.");
-        }
-
-        println!("[{app_id}] press Ctrl+C to stop.");
-        tokio::signal::ctrl_c().await?;
-        println!("\n[{app_id}] Ctrl+C received, shutting down...");
-    } else {
-        // No rc: just read N states and exit
-        let mut printed = 0usize;
-        while printed < n_states {
-            if let Some(msg) = link.next_state().await {
-                if let Some(Kind::State(s)) = msg.kind {
-                    println!("[{app_id}] state: {s}");
-                    printed += 1;
-                }
-            } else {
-                break;
             }
+        } else {
+            break;
         }
     }
 
-    // graceful shutdown for the simulator core
-    link.send(SimMsg {
-        kind: Some(Kind::Shutdown(true)),
-    })
-    .await;
-    let _ = join.await;
     println!("[{app_id}] local session done.");
+    drop(link);
+
     Ok(())
 }
 
 async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<()> {
-    println!("[{app_id}] connecting to REMOTE simulator at {addr}...");
+    use sim_proto::pb::sim::simulator_api_client::SimulatorApiClient;
     let mut client = SimulatorApiClient::connect(format!("http://{addr}")).await?;
 
-    let _ = client
-        .send(SimMsg {
-            kind: Some(Kind::Command(format!("init-from-{app_id}"))),
-        })
-        .await?;
-    let _ = client
-        .send(SimMsg {
-            kind: Some(Kind::Tick(42)),
+    // set up client->server stream
+    let (tx_req, rx_req) = mpsc::channel::<ClientMsg>(128);
+    let outbound = ReceiverStream::new(rx_req);
+
+    // start bidi stream
+    let mut rx = client.link(outbound).await?.into_inner();
+
+    // Register as contributing client.
+    tx_req
+        .send(ClientMsg {
+            app_id: app_id.into(),
+            body: Some(ClientMsgBody::Register(Register { contributes: true })),
         })
         .await?;
 
-    let mut stream = client.subscribe(Empty {}).await?.into_inner();
-    let mut count = 0usize;
-    while count < n_states {
-        match tokio::time::timeout(Duration::from_secs(3), stream.next()).await {
-            Ok(Some(Ok(msg))) => {
-                if let Some(Kind::State(s)) = msg.kind {
-                    println!("[{app_id}] state: {s}");
-                    count += 1;
+    // Prime the barrier for the initial tick.
+    tx_req
+        .send(ClientMsg {
+            app_id: app_id.into(),
+            body: Some(ClientMsgBody::StepReady(StepReady { tick: 0 })),
+        })
+        .await?;
+
+    let mut processed = 0usize;
+    let mut last_tick: u64 = 0;
+
+    while processed < n_states {
+        match tokio::time::timeout(STATE_WAIT_INTERVAL, rx.next()).await {
+            Ok(Some(Ok(ServerMsg {
+                body: Some(ServerMsgBody::State(s)),
+            }))) => {
+                let t = s.tick;
+                if t > last_tick {
+                    last_tick = t;
+
+                    tokio::time::sleep(CONTROL_INTERVAL).await;
+                    println!("{t} thruster values found");
+
+                    tx_req
+                        .send(ClientMsg {
+                            app_id: app_id.into(),
+                            body: Some(ClientMsgBody::StepReady(StepReady { tick: t })),
+                        })
+                        .await?;
+
+                    processed += 1;
                 }
             }
+            Ok(Some(Ok(_other))) => {}
             Ok(Some(Err(status))) => {
                 eprintln!("[{app_id}] stream error: {status}");
                 break;
@@ -160,13 +192,13 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
                 eprintln!("[{app_id}] stream ended");
                 break;
             }
-            Err(_elapsed) => {
+            Err(_) => {
                 eprintln!("[{app_id}] timed out waiting for state");
                 break;
             }
         }
     }
 
-    println!("[{app_id}] remote session done (printed {count}/{n_states} states).");
+    println!("[{app_id}] remote session done (processed {processed}/{n_states}).");
     Ok(())
 }

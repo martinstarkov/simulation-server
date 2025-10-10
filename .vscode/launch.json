@@ -1,0 +1,196 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    // ============================================================
+    // Windows: MSVC (cppvsdbg)
+    // ============================================================
+    {
+      "name": "Windows: Visualizer (non-blocking)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "cargo.exe",
+      "args": [
+        "run", "-p", "sim-remote-client", "--",
+        "--addr", "127.0.0.1:60000", "--n-states", "1000",
+        "--app-id", "visualizer-1"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Windows: Visualizer (blocking)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "cargo.exe",
+      "args": [
+        "run", "-p", "sim-remote-client", "--",
+        "--addr", "127.0.0.1:60000", "--n-states", "1000",
+        "--app-id", "visualizer-1", "--blocking"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Windows: Local Simulator",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "cargo.exe",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "local", "--n-states", "1000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Windows: Hybrid Simulator",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "cargo.exe",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "hybrid",
+        "--addr", "127.0.0.1:60000", "--n-states", "1000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Windows: Remote Simulator",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "cargo.exe",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "sim_service", "--",
+        "--addr", "127.0.0.1:60000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Windows: Remote Client 1",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "cargo.exe",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "remote", "--addr", "127.0.0.1:60000",
+        "--n-states", "1000", "--app-id", "Client-1"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Windows: Remote Client 2",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "cargo.exe",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "remote", "--addr", "127.0.0.1:60000",
+        "--n-states", "1000", "--app-id", "Client-2"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    // ============================================================
+    // OSX / Linux: LLDB (CodeLLDB)
+    // ============================================================
+    {
+      "name": "OSX: Visualizer (non-blocking)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "cargo",
+      "args": [
+        "run", "-p", "sim-remote-client", "--",
+        "--addr", "127.0.0.1:60000", "--n-states", "1000",
+        "--app-id", "visualizer-1"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated"
+    },
+    {
+      "name": "OSX: Visualizer (blocking)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "cargo",
+      "args": [
+        "run", "-p", "sim-remote-client", "--",
+        "--addr", "127.0.0.1:60000", "--n-states", "1000",
+        "--app-id", "visualizer-1", "--blocking"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated"
+    },
+    {
+      "name": "OSX: Local Simulator",
+      "type": "lldb",
+      "request": "launch",
+      "program": "cargo",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "local", "--n-states", "1000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated"
+    },
+    {
+      "name": "OSX: Hybrid Simulator",
+      "type": "lldb",
+      "request": "launch",
+      "program": "cargo",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "hybrid",
+        "--addr", "127.0.0.1:60000", "--n-states", "1000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated"
+    },
+    {
+      "name": "OSX: Remote Simulator",
+      "type": "lldb",
+      "request": "launch",
+      "program": "cargo",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "sim_service", "--",
+        "--addr", "127.0.0.1:60000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated"
+    },
+    {
+      "name": "OSX: Remote Client 1",
+      "type": "lldb",
+      "request": "launch",
+      "program": "cargo",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "remote", "--addr", "127.0.0.1:60000",
+        "--n-states", "1000", "--app-id", "Client-1"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated"
+    },
+    {
+      "name": "OSX: Remote Client 2",
+      "type": "lldb",
+      "request": "launch",
+      "program": "cargo",
+      "args": [
+        "run", "-p", "sim-app", "--bin", "app", "--",
+        "--mode", "remote", "--addr", "127.0.0.1:60000",
+        "--n-states", "1000", "--app-id", "Client-2"
+      ],
+      "cwd": "${workspaceFolder}",
+      "terminal": "integrated"
+    },
+  ]
+}

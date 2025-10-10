@@ -1,21 +1,60 @@
 syntax = "proto3";
 package sim;
 
-message SimMsg {
-  oneof kind {
-    string command = 1;
-    uint64 tick   = 2;
-    string state  = 3;
-    bool shutdown = 4;
+service SimulatorApi {
+  // One connection per client. Client sends Register/StepReady/Request;
+  // Server streams State/Ack/Response. Disconnect => auto-unregister.
+  rpc Link(stream ClientMsg) returns (stream ServerMsg);
+}
+
+// ===== Client -> Server =====
+message ClientMsg {
+  // Always include your client ID (first message SHOULD be Register).
+  string app_id = 1;
+
+  oneof body {
+    Register register    = 2; // join/leave blocking cohort
+    StepReady step_ready = 3; // vote to advance current tick
+    Request   request    = 4; // generic named request (optional data)
   }
 }
 
-message Ack { bool ok = 1; }
-message Empty {}
+message Register {
+  bool contributes = 1; // true => blocking cohort member; false => viewer-only
+}
 
-service SimulatorApi {
-  // App or remote client -> simulator
-  rpc Send(SimMsg) returns (Ack);
-  // Stream state updates from simulator
-  rpc Subscribe(Empty) returns (stream SimMsg);
+message StepReady {
+  uint64 tick = 1; // "I'm ready to advance tick=t"
+}
+
+message Request {
+  uint64 id   = 1; // optional correlation id (echoed back in Ack/Response)
+  string name = 2; // e.g., "set-thrust"
+  bytes  data = 3; // optional opaque payload (interpret by 'name')
+}
+
+// ===== Server -> Client =====
+message ServerMsg {
+  oneof body {
+    State    state    = 1; // simulator publishes current tick (and optional data)
+    Ack      ack      = 2; // acknowledgement to Request (no data)
+    Response response = 3; // data-bearing reply to Request (optional)
+  }
+}
+
+message State {
+  uint64 tick = 1; // current tick
+  bytes  data = 2; // optional snapshot/metadata (can be empty)
+}
+
+message Ack {
+  uint64 id   = 1; // echoes Request.id (if any)
+  bool   ok   = 2; // success/failure
+  string info = 3; // optional message
+}
+
+message Response {
+  uint64 id   = 1; // echoes Request.id
+  string name = 2; // echoes Request.name
+  bytes  data = 3; // payload for the reply
 }

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 #[derive(Parser)]
 struct Args {
-    /// Address to listen on (for app and remote clients)
+    /// Address to listen on (for remote control clients/viewers)
     #[arg(long, default_value = "0.0.0.0:50051")]
     addr: String,
 }
