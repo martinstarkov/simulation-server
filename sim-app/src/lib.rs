@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use std::thread;
+
 use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, Notify};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
@@ -17,6 +19,8 @@ use sim_proto::pb::sim::{
     simulator_api_server::{SimulatorApi, SimulatorApiServer},
     Ack, ClientMsg, Register, Request as Req, ServerMsg, State, StepReady,
 };
+
+pub mod client;
 
 pub const STEP_INTERVAL: Duration = Duration::from_millis(10);
 pub const CONTROL_INTERVAL: Duration = Duration::from_millis(500);
@@ -115,10 +119,14 @@ impl SimulatorCore {
         match msg.body {
             Some(sim_proto::pb::sim::client_msg::Body::Register(Register { contributes })) => {
                 if contributes {
+                    print!(
+                        "[Server] Registering contributing client: {}",
+                        app_id.clone()
+                    );
                     let entry = self.clients.entry(app_id.clone()).or_default();
                     entry.contributes = true;
 
-                    // NEW: immediately publish the current state so the joining contributor
+                    // Immediately publish the current state so the joining contributor
                     // sees the tick it's expected to StepReady for (avoids deadlock).
                     self.broadcast_state(self.tick);
                 } else {
@@ -134,6 +142,7 @@ impl SimulatorCore {
             }
             Some(sim_proto::pb::sim::client_msg::Body::Request(Req { id, name, data })) => {
                 match name.as_str() {
+                    // TODO: Add command processing here.
                     "set-thrust" => {
                         let _payload = data;
                         self.send_ack(id, true, "thrust set");
@@ -164,6 +173,7 @@ impl SimulatorCore {
 
         if let Some(ref mut rx_local) = rx_local_opt {
             while let Ok(msg) = rx_local.try_recv() {
+                println!("Server is handling a local msg");
                 self.handle_inmsg(msg);
             }
         }
@@ -174,7 +184,10 @@ impl SimulatorCore {
         // Try to grab at most one remote async message
         if let Some(rx_remote) = &mut self.rx_remote {
             match tokio::time::timeout(Duration::from_millis(1), rx_remote.recv()).await {
-                Ok(Some(msg)) => self.handle_inmsg(msg),
+                Ok(Some(msg)) => {
+                    println!("Server is handling a remote msg");
+                    self.handle_inmsg(msg);
+                }
                 _ => {} // timeout or channel closed — fine
             }
         }
@@ -184,6 +197,7 @@ impl SimulatorCore {
 
         if let Some(ref mut rx_local) = rx_local_opt {
             while let Ok(msg) = rx_local.try_recv() {
+                println!("Server is handling a local msg");
                 self.handle_inmsg(msg);
             }
         }
@@ -235,6 +249,13 @@ impl SimulatorCore {
     pub async fn run(mut self) {
         self.broadcast_state(self.tick);
         let mut step_timer = tokio::time::interval(STEP_INTERVAL);
+
+        // Wait for at least one contributing client before ticking
+        while self.cohort().is_empty() {
+            println!("Server is awaiting for a client to connect");
+            self.drain_messages().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         loop {
             self.drain_messages().await;
@@ -299,13 +320,19 @@ impl SimulatorApi for SimulatorSvc {
                                 *g = Some(cm.app_id.clone());
                             }
                         }
+                        println!(
+                            "[Server] received ClientMsg {:?}",
+                            cm.body.as_ref().map(|b| std::mem::discriminant(b))
+                        );
                         let _ = tx_in.send(CoreIn::FromClient(cm)).await;
                     }
                     Err(_status) => {
+                        eprintln!("[Server] inbound error: {_status}");
                         break;
                     }
                 }
             }
+            println!("[Server] client stream ended");
             if let Some(id) = app_id_holder2.lock().await.clone() {
                 let _ = tx_in.send(CoreIn::AutoUnregister { app_id: id }).await;
             }
@@ -369,55 +396,66 @@ async fn start_remote_service(
         bp: Arc::new(Backplane { tx_in, tx_out }),
     };
 
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(SimulatorApiServer::new(svc))
-            .serve(addr)
-            .await
-            .expect("gRPC service failed");
-    });
+    Server::builder()
+        .add_service(SimulatorApiServer::new(svc))
+        .serve(addr)
+        .await
+        .expect("gRPC service failed");
 
     eprintln!("[service] gRPC remote service started on {addr}");
     Ok(())
 }
 
+pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(fut)
+    } else {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(fut)
+    }
+}
+
 /// Spawn a simulator locally using only in-process (Crossbeam) channels.
 /// Fastest configuration; no remote gRPC service is started.
-pub fn spawn_local() -> Result<(LocalAppLink, tokio::task::JoinHandle<()>)> {
-    // Local channels only
+pub fn spawn_local() -> Result<(LocalAppLink, std::thread::JoinHandle<()>)> {
+    // Local channels
     let (tx_in_local, rx_in_local, tx_out_local, rx_out_local) = make_local_channels();
 
-    // Local app link
+    // App link
     let link = LocalAppLink {
         tx_in: tx_in_local.clone(),
         rx_out: rx_out_local,
     };
 
-    // Core: local only
+    // Core (local only)
     let core = SimulatorCore::new(Some(rx_in_local), None, Some(tx_out_local.clone()), None);
 
-    // Start the core
-    let join = start_simulator_core(core);
+    // Spawn in a background thread
+    let join = thread::spawn(move || {
+        block_on(async move {
+            core.run().await;
+        });
+    });
 
     Ok((link, join))
 }
 
 /// Spawn a simulator locally with both in-process (Crossbeam) channels
 /// and a gRPC remote service endpoint for external viewers/clients.
-pub async fn spawn_local_with_service(
+
+pub fn spawn_local_with_service(
     service_addr: SocketAddr,
-) -> Result<(LocalAppLink, tokio::task::JoinHandle<()>)> {
+) -> Result<(LocalAppLink, std::thread::JoinHandle<()>)> {
     // Local + remote channels
     let (tx_in_local, rx_in_local, tx_out_local, rx_out_local) = make_local_channels();
     let (tx_in_remote, rx_in_remote, tx_out_remote) = make_remote_channels();
 
-    // Local app link
     let link = LocalAppLink {
         tx_in: tx_in_local.clone(),
         rx_out: rx_out_local,
     };
 
-    // Hybrid core (handles both)
+    // Core handles both
     let core = SimulatorCore::new(
         Some(rx_in_local),
         Some(rx_in_remote),
@@ -425,11 +463,20 @@ pub async fn spawn_local_with_service(
         Some(tx_out_remote.clone()),
     );
 
-    // Spawn the simulator core
-    let join = start_simulator_core(core);
+    // Spawn in a background thread
+    let join = thread::spawn(move || {
+        block_on(async move {
+            let core_task = tokio::spawn(async move {
+                core.run().await;
+            });
 
-    // Start remote gRPC service
-    start_remote_service(service_addr, tx_in_remote.clone(), tx_out_remote.clone()).await?;
+            if let Err(e) = start_remote_service(service_addr, tx_in_remote, tx_out_remote).await {
+                eprintln!("[Hybrid] failed to start gRPC service: {e}");
+            }
+
+            let _ = core_task.await;
+        });
+    });
 
     Ok((link, join))
 }
@@ -454,4 +501,35 @@ pub async fn run_simulator_service(listen: SocketAddr) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Runs the remote simulator service in a blocking, synchronous context.
+///
+/// This starts a full simulator backend (core + gRPC API)
+/// and blocks until interrupted or the simulator exits.
+///
+/// Safe to call from any thread, or from a synchronous test.
+/// Does not require `#[tokio::main]` or `.await`.
+pub fn run_simulator_service_blocking(listen: SocketAddr) -> Result<()> {
+    let (tx_in_remote, rx_in_remote, tx_out_remote) = make_remote_channels();
+    let tx_out_for_core = tx_out_remote.clone();
+    let core = SimulatorCore::new(None, Some(rx_in_remote), None, Some(tx_out_for_core));
+
+    block_on(async move {
+        // Start gRPC service first
+        let svc_task = tokio::spawn(start_remote_service(
+            listen,
+            tx_in_remote.clone(),
+            tx_out_remote.clone(),
+        ));
+
+        // Wait briefly for service startup
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Start the simulator core
+        core.run().await;
+
+        svc_task.abort();
+        Ok(())
+    })
 }

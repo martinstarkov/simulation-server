@@ -42,17 +42,14 @@ struct Args {
     n_states: usize,
 }
 
-async fn run_local_session(
+fn run_local_session(
     link: LocalAppLink,
-    join: tokio::task::JoinHandle<()>,
+    join: std::thread::JoinHandle<()>,
     app_id: &str,
     n_states: usize,
 ) -> Result<()> {
     run_local(link, app_id, n_states)?;
-    tokio::select! {
-        _ = join => eprintln!("[Local] Simulator exited."),
-        _ = tokio::signal::ctrl_c() => eprintln!("[Local] Interrupted.")
-    }
+    join.join().expect("Simulator thread crashed");
     Ok(())
 }
 
@@ -66,15 +63,15 @@ async fn main() -> Result<()> {
         Mode::Local => {
             println!("[{id}] starting local simulator (local channels)...");
             let (link, join) = spawn_local()?;
-            run_local_session(link, join, id, args.n_states).await?;
+            run_local_session(link, join, id, args.n_states)?;
         }
         Mode::Hybrid => {
             let addr = args.addr.parse()?;
             println!(
                 "[{id}] starting hybrid simulator (local channels with gRPC service at {addr})..."
             );
-            let (link, join) = spawn_local_with_service(addr).await?;
-            run_local_session(link, join, id, args.n_states).await?;
+            let (link, join) = spawn_local_with_service(addr)?;
+            run_local_session(link, join, id, args.n_states)?;
         }
         Mode::Remote => {
             let addr = args.addr.parse()?;
