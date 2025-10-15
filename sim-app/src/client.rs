@@ -1,153 +1,223 @@
-use anyhow::Result;
-use crossbeam::channel::{self, Receiver, Sender};
+// client.rs
+use anyhow::{anyhow, Result};
 use std::{net::SocketAddr, thread};
-use tokio_stream::StreamExt;
+use tracing::info;
 
 use sim_proto::pb::sim::{simulator_api_client::SimulatorApiClient, ClientMsg, ServerMsg};
 
-use crate::{block_on, spawn_local, spawn_local_with_service, CoreIn, LocalAppLink};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
-fn wrap_local_link(link: LocalAppLink) -> (Sender<ClientMsg>, Receiver<ServerMsg>) {
-    let (tx_in, rx_in) = channel::bounded::<ClientMsg>(1024);
-    let (tx_out, rx_out) = channel::bounded::<ServerMsg>(1024);
+use crate::{block_on, spawn_hybrid, spawn_local, LocalAppLink};
 
-    // Forward client → simulator
-    let tx_in_link = link.tx_in.clone();
-    thread::spawn(move || {
-        for msg in rx_in.iter() {
-            let _ = tx_in_link.send(CoreIn::FromClient(msg));
-        }
-    });
+// =====================
+// Trait
+// =====================
 
-    // Forward simulator → client
-    thread::spawn(move || {
-        for msg in link.rx_out.iter() {
-            let _ = tx_out.send(msg);
-        }
-    });
-
-    (tx_in, rx_out)
+pub trait Client: Send {
+    fn send(&self, msg: ClientMsg) -> Result<()>;
+    fn recv(&mut self) -> Option<ServerMsg>;
+    fn join(self: Box<Self>) -> Result<()>;
 }
 
-/// Simulation mode (Local, Hybrid, or Remote)
+// Optional: a factory enum
 #[derive(Clone, Copy, Debug)]
-pub enum SimMode {
+pub enum Mode {
     Local,
-    Hybrid,
-    Remote,
+    Hybrid, // requires an addr
+    Remote, // requires an addr
 }
 
-/// Unified synchronous client interface for all simulator modes.
-/// Provides blocking `send()` and `recv()` methods regardless of transport.
-pub struct SimClient {
-    tx: Sender<ClientMsg>,
-    rx: Receiver<ServerMsg>,
-    _join: Option<thread::JoinHandle<()>>, // background thread for remote mode
-}
-
-impl SimClient {
-    /// Construct a synchronous client for the given mode.
-    ///
-    /// This function blocks until the simulator (local/hybrid/remote) is ready.
-    pub fn new(mode: SimMode, address: Option<SocketAddr>) -> Result<Self> {
-        match mode {
-            // === LOCAL ===
-            SimMode::Local => {
-                let (link, join) = spawn_local()?;
-                let (tx, rx) = wrap_local_link(link);
-                Ok(Self {
-                    tx,
-                    rx,
-                    _join: Some(join),
-                })
-            }
-
-            // === HYBRID ===
-            SimMode::Hybrid => {
-                let addr = address.unwrap();
-                let (link, join) = spawn_local_with_service(addr)?;
-                let (tx, rx) = wrap_local_link(link);
-                Ok(Self {
-                    tx,
-                    rx,
-                    _join: Some(join),
-                })
-            }
-
-            // === REMOTE ===
-            SimMode::Remote => {
-                let addr = address.unwrap();
-
-                let (tx_client_to_remote, rx_client_to_remote) =
-                    channel::bounded::<ClientMsg>(1024);
-                let (tx_remote_to_client, rx_remote_to_client) =
-                    channel::bounded::<ServerMsg>(1024);
-
-                let join = thread::spawn(move || {
-                    block_on(async move {
-                        let mut client =
-                            match SimulatorApiClient::connect(format!("http://{addr}")).await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("[SimClient] connect failed {addr}: {e}");
-                                    return;
-                                }
-                            };
-
-                        // client → server stream (tokio mpsc)
-                        let (tx_req, rx_req) = tokio::sync::mpsc::channel::<ClientMsg>(128);
-                        let outbound = tokio_stream::wrappers::ReceiverStream::new(rx_req);
-
-                        // start bidi stream
-                        let response = match client.link(outbound).await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("[SimClient] link failed: {e}");
-                                return;
-                            }
-                        };
-                        let mut rx_stream = response.into_inner();
-
-                        // BRIDGE 1: crossbeam (sync) -> tokio mpsc (gRPC outbound)
-                        {
-                            let tx_req_clone = tx_req.clone();
-                            let rx_sync = rx_client_to_remote.clone();
-                            std::thread::spawn(move || {
-                                for msg in rx_sync.iter() {
-                                    // IMPORTANT: use blocking_send from a blocking thread
-                                    if tx_req_clone.blocking_send(msg).is_err() {
-                                        break;
-                                    }
-                                }
-                            });
-                        }
-
-                        // BRIDGE 2: gRPC inbound -> crossbeam (sync) for user recv()
-                        while let Some(Ok(msg)) = rx_stream.next().await {
-                            let _ = tx_remote_to_client.send(msg);
-                        }
-                    });
-                });
-
-                Ok(Self {
-                    tx: tx_client_to_remote,
-                    rx: rx_remote_to_client,
-                    _join: Some(join),
-                })
-            }
-        }
+// Optional: factory that returns a boxed trait object
+pub fn new_client(mode: Mode, app_id: &str, addr: Option<SocketAddr>) -> Result<Box<dyn Client>> {
+    match mode {
+        Mode::Local => Ok(Box::new(LocalClient::new(app_id)?)),
+        Mode::Hybrid => Ok(Box::new(HybridClient::new(
+            app_id,
+            addr.expect("Hybrid needs addr"),
+        )?)),
+        Mode::Remote => Ok(Box::new(RemoteClient::new(
+            app_id,
+            addr.expect("Remote needs addr"),
+        )?)),
     }
+}
 
-    /// Send a message to the simulator (blocking).
-    pub fn send(&self, msg: ClientMsg) -> Result<()> {
-        println!("Sending client message to server");
-        self.tx.send(msg)?;
+// =====================
+// Local client
+// =====================
+
+pub struct LocalClient {
+    link: LocalAppLink,
+    core: thread::JoinHandle<()>, // simulator core running locally
+}
+
+impl LocalClient {
+    pub fn new(app_id: &str) -> Result<Self> {
+        info!("[Client: {app_id}] Creating LocalClient");
+        let (link, core) = spawn_local(app_id)?;
+        Ok(Self { link, core })
+    }
+}
+
+impl Client for LocalClient {
+    fn send(&self, msg: ClientMsg) -> Result<()> {
+        self.link.send(msg);
         Ok(())
     }
 
-    /// Receive the next message from the simulator (blocking).
-    pub fn recv(&self) -> Option<ServerMsg> {
-        println!("Receiving server msg on client");
-        self.rx.recv().ok()
+    fn recv(&mut self) -> Option<ServerMsg> {
+        // LocalAppLink::next() blocks on crossbeam::Receiver::recv()
+        self.link.next()
+    }
+
+    fn join(self: Box<Self>) -> Result<()> {
+        self.link.shutdown();
+        info!("[Client: {}] Joining core server thread", self.link.app_id);
+        self.core
+            .join()
+            .map_err(|_| anyhow!("Core thread failed to join"))
+    }
+}
+
+// =====================
+// Hybrid client
+// (Local channel path, but also starts a gRPC service for external viewers)
+// =====================
+
+pub struct HybridClient {
+    link: LocalAppLink,
+    core: thread::JoinHandle<()>, // simulator core
+    svc: thread::JoinHandle<()>,  // gRPC service running locally
+    svc_shutdown: tokio::sync::watch::Sender<bool>,
+}
+
+impl HybridClient {
+    pub fn new(app_id: &str, addr: SocketAddr) -> Result<Self> {
+        info!("[Client: {app_id}] Creating HybridClient");
+        let (link, core, svc, svc_shutdown) = spawn_hybrid(app_id, addr)?;
+        Ok(Self {
+            link,
+            core,
+            svc,
+            svc_shutdown,
+        })
+    }
+}
+
+impl Client for HybridClient {
+    fn send(&self, msg: ClientMsg) -> Result<()> {
+        self.link.send(msg);
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Option<ServerMsg> {
+        self.link.next()
+    }
+
+    fn join(self: Box<Self>) -> Result<()> {
+        let _ = self.svc_shutdown.send(true);
+        info!("[Client: {}] Joining service thread", self.link.app_id);
+        self.svc
+            .join()
+            .map_err(|_| anyhow!("Service thread failed to join"))?;
+
+        self.link.shutdown();
+        info!("[Client: {}] Joining core server thread", self.link.app_id);
+        self.core
+            .join()
+            .map_err(|_| anyhow!("Core thread failed to join"))?;
+
+        Ok(())
+    }
+}
+
+// =====================
+// Remote client
+// (Background thread runs tokio + tonic bidi; sync facade via blocking_*)
+// =====================
+
+pub struct RemoteClient {
+    app_id: String,
+    tx: mpsc::Sender<ClientMsg>,
+    rx: mpsc::Receiver<ServerMsg>,
+    remote: thread::JoinHandle<()>,
+}
+
+impl RemoteClient {
+    pub fn new(app_id: &str, addr: SocketAddr) -> Result<Self> {
+        info!("[Client: {app_id}] Creating RemoteClient");
+        // channels for the sync facade
+        let (tx_to_rt, rx_from_user) = mpsc::channel::<ClientMsg>(256);
+        let (tx_to_user, rx_from_rt) = mpsc::channel::<ServerMsg>(256);
+
+        let app_id_thread = app_id.to_string();
+
+        let remote = thread::spawn(move || {
+            block_on(async move {
+                // connect tonic client
+                let mut grpc = match SimulatorApiClient::connect(format!("http://{addr}")).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        info!("[Client: {app_id_thread}] Remote connection failed {addr}: {e}");
+                        return;
+                    }
+                };
+
+                // user -> server: stream driven by rx_from_user
+                let outbound = ReceiverStream::new(rx_from_user);
+
+                // open bidi stream
+                let mut inbound = match grpc.link(outbound).await {
+                    Ok(resp) => resp.into_inner(),
+                    Err(e) => {
+                        info!("[Client: {app_id_thread}] remote link failed: {e}");
+                        return;
+                    }
+                };
+
+                // server -> user
+                while let Some(Ok(msg)) = inbound.next().await {
+                    if tx_to_user.send(msg).await.is_err() {
+                        break; // user dropped receiver
+                    }
+                }
+            });
+        });
+
+        Ok(Self {
+            app_id: app_id.to_string(),
+            tx: tx_to_rt,
+            rx: rx_from_rt,
+            remote,
+        })
+    }
+}
+
+impl Client for RemoteClient {
+    fn send(&self, msg: ClientMsg) -> Result<()> {
+        //info!("[Client: {}]: Sending ClientMsg", self.app_id);
+        // Requires tokio's "sync" feature for blocking_send
+        self.tx
+            .blocking_send(msg)
+            .map_err(|e| anyhow!("Remote client send failed: {e}"))
+    }
+
+    fn recv(&mut self) -> Option<ServerMsg> {
+        // Requires tokio's "sync" feature for blocking_recv
+        let msg = self.rx.blocking_recv();
+        // if msg.is_some() {
+        //     info!("[Client: {}] Receiving ServerMsg", self.app_id);
+        // }
+        msg
+    }
+
+    fn join(self: Box<Self>) -> Result<()> {
+        info!("[Client: {}] Joining remote thread", self.app_id);
+
+        self.remote
+            .join()
+            .map_err(|e| anyhow!("Remote thread failed to join"))
     }
 }
