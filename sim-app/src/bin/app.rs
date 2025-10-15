@@ -1,15 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use sim_app::{
-    spawn_local, spawn_local_with_service, LocalAppLink, CONTROL_INTERVAL, STATE_WAIT_INTERVAL,
-};
+use sim_app::{spawn_hybrid, spawn_local, LocalAppLink, CONTROL_INTERVAL, STATE_WAIT_INTERVAL};
 use sim_proto::pb::sim::{ClientMsg, ClientMsgBody, Register, ServerMsg, ServerMsgBody, StepReady};
 use std::net::SocketAddr;
 use std::thread;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tracing::info;
 
 #[derive(ValueEnum, Clone)]
 enum Mode {
@@ -33,24 +31,13 @@ struct Args {
     #[arg(long = "remote-viewer", default_value_t = false)]
     remote_viewer: bool,
 
-    /// Identifier printed alongside all app logs/states
+    /// Identifier alongside all app logs/states
     #[arg(long, default_value = "app-1")]
     app_id: String,
 
     /// How many states to process before exiting
     #[arg(long = "n-states", default_value_t = 5)]
     n_states: usize,
-}
-
-fn run_local_session(
-    link: LocalAppLink,
-    join: std::thread::JoinHandle<()>,
-    app_id: &str,
-    n_states: usize,
-) -> Result<()> {
-    run_local(link, app_id, n_states)?;
-    join.join().expect("Simulator thread crashed");
-    Ok(())
 }
 
 #[tokio::main]
@@ -61,21 +48,19 @@ async fn main() -> Result<()> {
 
     match args.mode {
         Mode::Local => {
-            println!("[{id}] starting local simulator (local channels)...");
-            let (link, join) = spawn_local()?;
-            run_local_session(link, join, id, args.n_states)?;
+            let (link, join) = spawn_local(id)?;
+            run_local(link, id, args.n_states)?;
+            join.join().expect("Simulator thread crashed");
         }
         Mode::Hybrid => {
             let addr = args.addr.parse()?;
-            println!(
-                "[{id}] starting hybrid simulator (local channels with gRPC service at {addr})..."
-            );
-            let (link, join) = spawn_local_with_service(addr)?;
-            run_local_session(link, join, id, args.n_states)?;
+            let (link, core_join, svc_join, _svc_shutdown) = spawn_hybrid(id, addr)?;
+            run_local(link, id, args.n_states)?;
+            core_join.join().expect("Simulator thread crashed");
+            svc_join.join().expect("Service thread crashed");
         }
         Mode::Remote => {
             let addr = args.addr.parse()?;
-            println!("[{id}] connecting to remote simulator at {addr}...");
             run_remote(addr, id, args.n_states).await?
         }
     }
@@ -107,7 +92,7 @@ fn run_local(link: LocalAppLink, app_id: &str, n_states: usize) -> Result<()> {
 
                     thread::sleep(CONTROL_INTERVAL);
 
-                    println!("{t} thruster values found");
+                    info!("{t} thruster values found");
 
                     link.send(ClientMsg {
                         app_id: app_id.to_string(),
@@ -122,7 +107,7 @@ fn run_local(link: LocalAppLink, app_id: &str, n_states: usize) -> Result<()> {
         }
     }
 
-    println!("[{app_id}] local session done.");
+    info!("[{app_id}] local session done.");
     drop(link);
 
     Ok(())
@@ -168,7 +153,7 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
                     last_tick = t;
 
                     tokio::time::sleep(CONTROL_INTERVAL).await;
-                    println!("{t} thruster values found");
+                    info!("{t} thruster values found");
 
                     tx_req
                         .send(ClientMsg {
@@ -182,20 +167,20 @@ async fn run_remote(addr: SocketAddr, app_id: &str, n_states: usize) -> Result<(
             }
             Ok(Some(Ok(_other))) => {}
             Ok(Some(Err(status))) => {
-                eprintln!("[{app_id}] stream error: {status}");
+                info!("[{app_id}] stream error: {status}");
                 break;
             }
             Ok(None) => {
-                eprintln!("[{app_id}] stream ended");
+                info!("[{app_id}] stream ended");
                 break;
             }
             Err(_) => {
-                eprintln!("[{app_id}] timed out waiting for state");
+                info!("[{app_id}] timed out waiting for state");
                 break;
             }
         }
     }
 
-    println!("[{app_id}] remote session done (processed {processed}/{n_states}).");
+    info!("[{app_id}] remote session done (processed {processed}/{n_states}).");
     Ok(())
 }

@@ -13,3 +13,5 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-core = "0.3"
 sim_proto = { package = "sim-proto", path = "../sim-proto" }
 crossbeam = "0.8"
+tracing = { version = "0.1", features = ["log"] }     # macros + log compatibility
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
