@@ -17,7 +17,7 @@ fn test_hybrid_local() -> anyhow::Result<()> {
 
     let app_id = "client-1";
 
-    let client = new_client(Mode::Hybrid, app_id, Some(addr))?;
+    let client = new_client(Mode::Hybrid, true, app_id, Some(addr))?;
 
     run_sim(client, app_id, 5)?;
     Ok(())
@@ -31,7 +31,7 @@ fn test_hybrid_viewer_nonblocking() -> anyhow::Result<()> {
 
     let app_id = "client-1";
 
-    let client = new_client(Mode::Hybrid, app_id, Some(addr))?;
+    let client = new_client(Mode::Hybrid, true, app_id, Some(addr))?;
 
     std::thread::sleep(Duration::from_millis(200)); // let service bind.
 
@@ -53,7 +53,7 @@ fn test_hybrid_viewer_blocking() -> anyhow::Result<()> {
 
     let app_id = "client-1";
 
-    let client = new_client(Mode::Hybrid, app_id, Some(addr))?;
+    let client = new_client(Mode::Hybrid, true, app_id, Some(addr))?;
 
     std::thread::sleep(Duration::from_millis(200)); // let service bind.
 

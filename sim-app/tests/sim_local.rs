@@ -13,7 +13,7 @@ fn test_local() -> anyhow::Result<()> {
 
     let app_id = "client-1";
 
-    let client = new_client(Mode::Local, app_id, None)?;
+    let client = new_client(Mode::Local, true, app_id, None)?;
 
     run_sim(client, app_id, 5)?;
 

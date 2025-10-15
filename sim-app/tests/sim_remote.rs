@@ -24,7 +24,7 @@ fn test_remote() -> anyhow::Result<()> {
 
     let app_id = "client-1";
 
-    let client = new_client(Mode::Remote, app_id, Some(addr))?;
+    let client = new_client(Mode::Remote, true, app_id, Some(addr))?;
 
     run_sim(client, app_id, 5)?;
     Ok(())

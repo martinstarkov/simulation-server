@@ -24,6 +24,7 @@ use sim_proto::pb::sim::{
 };
 
 pub mod client;
+pub mod tick_tracker;
 
 pub const STEP_INTERVAL: Duration = Duration::from_millis(10);
 pub const CONTROL_INTERVAL: Duration = Duration::from_millis(500);

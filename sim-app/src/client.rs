@@ -3,13 +3,16 @@ use anyhow::{anyhow, Result};
 use std::{net::SocketAddr, thread};
 use tracing::info;
 
-use sim_proto::pb::sim::{simulator_api_client::SimulatorApiClient, ClientMsg, ServerMsg};
+use sim_proto::pb::sim::{
+    simulator_api_client::SimulatorApiClient, ClientMsg, ClientMsgBody, Register, ServerMsg,
+    StepReady,
+};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::{block_on, spawn_hybrid, spawn_local, LocalAppLink};
+use crate::{block_on, spawn_hybrid, spawn_local, tick_tracker::TickTracker, LocalAppLink};
 
 // =====================
 // Trait
@@ -19,6 +22,44 @@ pub trait Client: Send {
     fn send(&self, msg: ClientMsg) -> Result<()>;
     fn recv(&mut self) -> Option<ServerMsg>;
     fn join(self: Box<Self>) -> Result<()>;
+
+    fn app_id(&self) -> &String;
+
+    fn step(&self, tick: u64) -> Result<()> {
+        if !self.contributes() {
+            return Ok(());
+        }
+        let app_id = self.app_id().clone();
+        info!("[Client: {app_id}] Sending StepReady: {tick}");
+        self.send(ClientMsg {
+            app_id,
+            body: Some(ClientMsgBody::StepReady(StepReady { tick })),
+        })
+    }
+
+    fn contributes(&self) -> bool;
+
+    fn set_contributes(&mut self, contributes: bool);
+
+    fn register(&mut self, contributes: bool) -> Result<()> {
+        let app_id = self.app_id().clone();
+        info!("[Client: {app_id}] Sending Register");
+        self.set_contributes(contributes);
+        self.send(ClientMsg {
+            app_id,
+            body: Some(ClientMsgBody::Register(Register { contributes })),
+        })
+    }
+
+    fn tick_tracker(&mut self) -> &mut TickTracker;
+
+    fn try_step(&mut self, tick: u64) -> Result<()> {
+        let app_id = self.app_id().clone();
+        if let Some(t) = self.tick_tracker().update_with(&app_id, tick) {
+            self.step(t)?;
+        }
+        Ok(())
+    }
 }
 
 // Optional: a factory enum
@@ -29,9 +70,13 @@ pub enum Mode {
     Remote, // requires an addr
 }
 
-// Optional: factory that returns a boxed trait object
-pub fn new_client(mode: Mode, app_id: &str, addr: Option<SocketAddr>) -> Result<Box<dyn Client>> {
-    match mode {
+pub fn new_client(
+    mode: Mode,
+    contributes: bool,
+    app_id: &str,
+    addr: Option<SocketAddr>,
+) -> Result<Box<dyn Client>> {
+    let c: Result<Box<dyn Client>> = match mode {
         Mode::Local => Ok(Box::new(LocalClient::new(app_id)?)),
         Mode::Hybrid => Ok(Box::new(HybridClient::new(
             app_id,
@@ -41,7 +86,17 @@ pub fn new_client(mode: Mode, app_id: &str, addr: Option<SocketAddr>) -> Result<
             app_id,
             addr.expect("Remote needs addr"),
         )?)),
+    };
+
+    let mut client = c?;
+
+    client.register(contributes)?;
+
+    if contributes {
+        client.step(0)?;
     }
+
+    Ok(client)
 }
 
 // =====================
@@ -51,13 +106,20 @@ pub fn new_client(mode: Mode, app_id: &str, addr: Option<SocketAddr>) -> Result<
 pub struct LocalClient {
     link: LocalAppLink,
     core: thread::JoinHandle<()>, // simulator core running locally
+    tick_tracker: TickTracker,
+    contributes: bool,
 }
 
 impl LocalClient {
     pub fn new(app_id: &str) -> Result<Self> {
         info!("[Client: {app_id}] Creating LocalClient");
         let (link, core) = spawn_local(app_id)?;
-        Ok(Self { link, core })
+        Ok(Self {
+            link,
+            core,
+            tick_tracker: TickTracker::default(),
+            contributes: false,
+        })
     }
 }
 
@@ -70,6 +132,22 @@ impl Client for LocalClient {
     fn recv(&mut self) -> Option<ServerMsg> {
         // LocalAppLink::next() blocks on crossbeam::Receiver::recv()
         self.link.next()
+    }
+
+    fn app_id(&self) -> &String {
+        &self.link.app_id
+    }
+
+    fn tick_tracker(&mut self) -> &mut TickTracker {
+        &mut self.tick_tracker
+    }
+
+    fn contributes(&self) -> bool {
+        self.contributes
+    }
+
+    fn set_contributes(&mut self, contributes: bool) {
+        self.contributes = contributes;
     }
 
     fn join(self: Box<Self>) -> Result<()> {
@@ -91,6 +169,8 @@ pub struct HybridClient {
     core: thread::JoinHandle<()>, // simulator core
     svc: thread::JoinHandle<()>,  // gRPC service running locally
     svc_shutdown: tokio::sync::watch::Sender<bool>,
+    tick_tracker: TickTracker,
+    contributes: bool,
 }
 
 impl HybridClient {
@@ -102,6 +182,8 @@ impl HybridClient {
             core,
             svc,
             svc_shutdown,
+            tick_tracker: TickTracker::default(),
+            contributes: false,
         })
     }
 }
@@ -114,6 +196,22 @@ impl Client for HybridClient {
 
     fn recv(&mut self) -> Option<ServerMsg> {
         self.link.next()
+    }
+
+    fn app_id(&self) -> &String {
+        &self.link.app_id
+    }
+
+    fn contributes(&self) -> bool {
+        self.contributes
+    }
+
+    fn set_contributes(&mut self, contributes: bool) {
+        self.contributes = contributes;
+    }
+
+    fn tick_tracker(&mut self) -> &mut TickTracker {
+        &mut self.tick_tracker
     }
 
     fn join(self: Box<Self>) -> Result<()> {
@@ -143,6 +241,8 @@ pub struct RemoteClient {
     tx: mpsc::Sender<ClientMsg>,
     rx: mpsc::Receiver<ServerMsg>,
     remote: thread::JoinHandle<()>,
+    tick_tracker: TickTracker,
+    contributes: bool,
 }
 
 impl RemoteClient {
@@ -191,6 +291,8 @@ impl RemoteClient {
             tx: tx_to_rt,
             rx: rx_from_rt,
             remote,
+            tick_tracker: TickTracker::default(),
+            contributes: false,
         })
     }
 }
@@ -202,6 +304,22 @@ impl Client for RemoteClient {
         self.tx
             .blocking_send(msg)
             .map_err(|e| anyhow!("Remote client send failed: {e}"))
+    }
+
+    fn app_id(&self) -> &String {
+        &self.app_id
+    }
+
+    fn tick_tracker(&mut self) -> &mut TickTracker {
+        &mut self.tick_tracker
+    }
+
+    fn contributes(&self) -> bool {
+        self.contributes
+    }
+
+    fn set_contributes(&mut self, contributes: bool) {
+        self.contributes = contributes;
     }
 
     fn recv(&mut self) -> Option<ServerMsg> {
@@ -218,6 +336,6 @@ impl Client for RemoteClient {
 
         self.remote
             .join()
-            .map_err(|e| anyhow!("Remote thread failed to join"))
+            .map_err(|_| anyhow!("Remote thread failed to join"))
     }
 }
