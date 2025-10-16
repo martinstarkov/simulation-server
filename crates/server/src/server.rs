@@ -247,6 +247,8 @@ impl<S: Simulation> Simulator for SimSvc<S> {
 
         // Drive inbound messages in an async task
         tokio::spawn(async move {
+            let mut client_id: Option<u64> = None;
+
             while let Ok(Some(msg)) = inbound.message().await {
                 match msg.msg {
                     // Contributing clients tick barrier
@@ -257,6 +259,7 @@ impl<S: Simulation> Simulator for SimSvc<S> {
                     // Registration: reply with Registered immediately, then forward coordinator stream
                     Some(interface::interface::client_msg::Msg::Register(req)) => {
                         let (id, out_rx) = coord.register(&req.client_name, req.contributing);
+                        client_id = Some(id);
 
                         // 1) Send Registered immediately so the client can proceed
                         let _ = tx
@@ -281,6 +284,11 @@ impl<S: Simulation> Simulator for SimSvc<S> {
                     // Everything else goes to the simulation handler through the coordinator
                     _ => coord.send_message(msg),
                 }
+            }
+
+            if let Some(id) = client_id {
+                info!("[Coordinator] Client #{id} disconnected");
+                coord.remove(id);
             }
         });
 
