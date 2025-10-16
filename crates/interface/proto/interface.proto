@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package interface;
+
+import "google/protobuf/empty.proto";
+
+// ---------- Core types ----------
+
+// Identify a client on registration.
+message RegisterRequest {
+  string client_name = 1;
+  bool   contributing = 2; // if true, this client participates in the step barrier
+}
+
+message RegisterResponse {
+  uint64 client_id = 1; // assigned by the simulator
+}
+
+// Barrier signal from a contributing client.
+// `tick_seq` can be used by advanced clients to indicate which tick they believe
+// they’re ready for; servers may ignore it if not needed.
+message StepReady {
+  uint64 client_id = 1;
+  uint64 tick_seq  = 2;
+}
+
+// Monotonic simulation step marker.
+message Tick {
+  uint64 seq     = 1;  // step sequence (0..N)
+  int64  time_ns = 2;  // simulation time in nanoseconds (optional; 0 if unused)
+}
+
+// Optional: full observation/state snapshot pushed or returned via unary.
+// Define to match your sim. A common pattern is a flat list of objects.
+message Observation {
+  repeated Object objects = 1;
+  // add more fields as needed (e.g., environment params)
+}
+
+// Example dynamic object. Adjust to your engine’s schema.
+message Object {
+  uint32 id  = 1;
+  Vec3   pos = 2;
+  Quat   rot = 3;
+}
+
+message Vec3 { float x = 1; float y = 2; float z = 3; }
+message Quat { float x = 1; float y = 2; float z = 3; float w = 4; }
+
+// Controller → Simulator command (per-step inputs).
+// Put your torques/velocities/etc. inside.
+message ControlOutput {
+  // example payloads; customize freely
+  repeated ActuatorCmd actuators = 1;
+}
+
+message ActuatorCmd {
+  uint32 id = 1;
+  float  value = 2;
+}
+
+// Runtime parameter update (e.g., “wind = 2.0” from UI).
+message ParamUpdate {
+  string key       = 1;
+  float  f32_value = 2;
+}
+
+// Reset the simulation (semantics are server-defined).
+message ResetCommand {}
+
+// Optional convenience for pushing error info down the stream.
+message ErrorMsg {
+  string message = 1;
+}
+
+// ---------- Envelopes (wire format) ----------
+
+message ClientMsg {
+  oneof msg {
+    RegisterRequest register     = 1;
+    StepReady       step_ready   = 2;
+    ControlOutput   control      = 3;
+    ParamUpdate     param_update = 4;
+    ResetCommand    reset        = 5;
+  }
+}
+
+message ServerMsg {
+  oneof msg {
+    RegisterResponse registered = 1;
+    Tick             tick       = 2;
+    Observation      state      = 3; // optional push; servers may also expose unary GetLatestState
+    ErrorMsg         error_msg  = 4;
+  }
+}
+
+// ---------- Service ----------
+
+service Simulator {
+  // Primary bidi stream. Clients send ClientMsg; server pushes ServerMsg.
+  // Typical flows:
+  //   - Contributing: Register(contrib=true) → loop { StepReady → server pushes Tick (+ optional state) }
+  //   - Non-contrib:  Register(contrib=false) → server may push Tick/State as it advances.
+  rpc Open(stream ClientMsg) returns (stream ServerMsg);
+
+  // Optional unary helpers for pull-based clients (e.g., viewers polling state).
+  rpc GetLatestTick (google.protobuf.Empty) returns (Tick);
+  rpc GetLatestState(google.protobuf.Empty) returns (Observation);
+}

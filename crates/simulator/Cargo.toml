@@ -1,0 +1,13 @@
+[package]
+name = "simulator"
+authors = ["Martin Starkov"]
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+interface = { workspace = true }

@@ -1,3 +1,62 @@
 [workspace]
+members = [
+  "crates/simulator",
+  "crates/interface",
+  "crates/client",
+  "crates/server",
+  "crates/controller",
+  "crates/visualizer",
+]
 resolver = "2"
-members = ["sim-proto", "sim-app", "sim-remote-client"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90.0"
+
+[workspace.dependencies]
+anyhow = "1"
+crossbeam-channel = "0.5"
+futures = "0.3"
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["transport"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+interface = { path = "crates/interface" }
+simulator = { path = "crates/simulator" }
+client = { path = "crates/client" }
+server = { path = "crates/server" }
+
+# Enable a small amount of optimization in the dev profile.
+[profile.dev]
+opt-level = 1
+incremental = true
+
+# Enable a large amount of optimization in the dev profile for dependencies.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+# Enable more optimization in the release profile at the cost of compile time.
+[profile.release]
+# Compile the entire crate as one unit.
+# Slows compile times, marginal improvements.
+codegen-units = 1
+# Do a second optimization pass over the entire program, including dependencies.
+# Slows compile times, marginal improvements.
+lto = "thin"
+opt-level = 3
+debug = false
+incremental = true       # Incremental compilation.
+
+# Optimize for size in the wasm-release profile to reduce load times and bandwidth usage on web.
+[profile.wasm-release]
+# Default to release profile values.
+inherits = "release"
+# Optimize with size in mind (also try "z", sometimes it is better).
+# Slightly slows compile times, great improvements to file size and runtime performance.
+opt-level = "s"
+# Strip all debugging information from the binary to slightly reduce file size.
+strip = "debuginfo"
