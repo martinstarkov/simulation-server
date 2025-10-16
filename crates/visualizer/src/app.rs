@@ -1,27 +1,24 @@
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use crossbeam_channel as xchan;
 use interface::interface::{ServerMsg, server_msg};
+
 use std::time::{Duration, Instant};
 
-fn limit_fps_system(mut last: Local<Option<Instant>>) {
-    let target = Duration::from_millis(100); // 16 ms == ~60 FPS
-    let now = Instant::now();
+const TARGET_FPS: f64 = 1.0;
 
-    if let Some(prev) = *last {
-        let elapsed = now.duration_since(prev);
-        if elapsed < target {
-            std::thread::sleep(target - elapsed);
-        }
-    }
-
-    *last = Some(now);
-}
+#[derive(Resource)]
+struct FpsLimiter(Timer);
 
 #[derive(Resource)]
 pub struct Inbox(pub xchan::Receiver<ServerMsg>);
 
 #[derive(Resource)]
 pub struct StepBarrier(pub xchan::Sender<()>);
+
+fn notify_worker_frame_done(barrier: Res<StepBarrier>) {
+    let _ = barrier.0.try_send(());
+}
 
 #[derive(Component)]
 pub struct SimObject {
@@ -30,8 +27,8 @@ pub struct SimObject {
 
 #[derive(Resource, Default)]
 pub struct SimState {
-    pub latest_tick: Option<u64>,    // newest tick from the server
-    pub displayed_tick: Option<u64>, // tick currently shown on screen
+    pub tick: u64, // newest tick from the server
+    pub started: bool,
 }
 
 #[derive(Component)]
@@ -42,19 +39,26 @@ pub fn run_bevy(rx_app: xchan::Receiver<ServerMsg>, tx_done: xchan::Sender<()>) 
         .add_plugins(DefaultPlugins.build().disable::<bevy::log::LogPlugin>())
         .insert_resource(Inbox(rx_app))
         .insert_resource(StepBarrier(tx_done))
-        .add_systems(Startup, (setup_scene, setup_ui))
         .insert_resource(SimState::default())
-        .add_systems(Update, (drain_inbox, update_tick_ui, drain_and_apply_state))
-        .add_systems(
-            Last,
-            (
-                advance_displayed_tick,
-                limit_fps_system,
-                notify_worker_frame_done,
-            )
-                .chain(),
-        )
+        .add_systems(Startup, (setup_scene, setup_ui))
+        //.add_systems(Update, send_initial_step_ready_when_window_ready)
+        .add_systems(Update, (drain_inbox, update_tick_ui, run_sim_logic).chain())
         .run();
+}
+
+fn run_sim_logic(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut limiter: ResMut<FpsLimiter>,
+    mut state: ResMut<SimState>,
+    barrier: Res<StepBarrier>,
+) {
+    limiter.0.tick(time.delta());
+
+    // Only run this logic when timer fires
+    if limiter.0.is_finished() || keyboard.pressed(KeyCode::Space) {
+        let _ = barrier.0.try_send(());
+    }
 }
 
 fn setup_scene(
@@ -62,6 +66,11 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    commands.insert_resource(FpsLimiter(Timer::from_seconds(
+        1.0 / TARGET_FPS as f32,
+        TimerMode::Repeating,
+    )));
+
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 5.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -115,44 +124,30 @@ fn setup_ui(mut commands: Commands, asset_server: Res<AssetServer>) {
         });
 }
 
-fn notify_worker_frame_done(barrier: Res<StepBarrier>) {
-    // non-blocking send; ignore if full
-    let _ = barrier.0.try_send(());
-}
-
-fn drain_and_apply_state(inbox: Res<Inbox>, mut q: Query<(&SimObject, &mut Transform)>) {
-    for msg in inbox.0.try_iter() {
-        if let Some(server_msg::Msg::State(_obs)) = msg.msg {
-            for (_obj, mut _tf) in q.iter_mut() {
-                // TODO: update transform from sim state.
-            }
-        }
-    }
-}
-
-fn drain_inbox(inbox: Res<Inbox>, mut state: ResMut<SimState>) {
+fn drain_inbox(
+    inbox: Res<Inbox>,
+    mut state: ResMut<SimState>,
+    mut q: Query<(&SimObject, &mut Transform)>,
+) {
     for msg in inbox.0.try_iter() {
         match msg.msg {
             Some(server_msg::Msg::Tick(t)) => {
-                state.latest_tick = Some(t.seq);
+                state.tick = t.seq;
+                println!("Received tick: {}", t.seq);
             }
             Some(server_msg::Msg::State(_obs)) => {
-                // update object transforms etc. if needed
+                println!("Received state");
+                for (_obj, mut _tf) in q.iter_mut() {
+                    // TODO: update transform from sim state.
+                }
             }
             _ => {}
         }
     }
 }
 
-fn advance_displayed_tick(mut state: ResMut<SimState>) {
-    if state.latest_tick != state.displayed_tick {
-        state.displayed_tick = state.latest_tick;
-    }
-}
 fn update_tick_ui(state: Res<SimState>, mut query: Query<&mut Text, With<TickText>>) {
-    if let Some(tick) = state.displayed_tick {
-        if let Ok(mut text) = query.single_mut() {
-            *text = Text::new(format!("Tick: {}", tick));
-        }
+    if let Ok(mut text) = query.single_mut() {
+        text.0 = format!("Tick: {}", state.tick);
     }
 }

@@ -14,7 +14,7 @@ use tracing::info;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Run without gRPC networking (local-only mode).
-    #[arg(long)]
+    #[arg(long, default_value = "false")]
     local: bool,
 
     /// Listen address for gRPC mode (ignored if --local).

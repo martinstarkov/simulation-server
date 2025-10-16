@@ -1,6 +1,7 @@
 use std::{
     sync::Arc,
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow};
@@ -8,7 +9,10 @@ use crossbeam_channel as xchan;
 
 use interface::{
     Simulation,
-    interface::{ClientMsg, ServerMsg, server_msg, simulator_client::SimulatorClient},
+    interface::{
+        ClientMsg, RegisterRequest, RegisterResponse, ServerMsg, StepReady, client_msg, server_msg,
+        simulator_client::SimulatorClient,
+    },
 };
 
 use server::server::{SimServer, safe_block_on};
@@ -191,4 +195,80 @@ pub fn connect_local<S: Simulation>(server: &Arc<SimServer<S>>) -> Result<SyncSi
         rx_from_worker: to_app_rx,
         _join: join,
     })
+}
+
+fn spawn_step_thread(
+    name: &str,
+    work_ms: u64,
+    sim: SyncSimClient,
+) -> thread::JoinHandle<Result<()>> {
+    let name = name.to_string();
+    thread::Builder::new()
+        .name(name.clone())
+        .spawn(move || {
+            // 1) Register (contributing)
+            sim.send(ClientMsg {
+                msg: Some(client_msg::Msg::Register(RegisterRequest {
+                    client_name: name.clone(),
+                    contributing: true,
+                })),
+            })?;
+
+            println!("[Client: {name}] Registering step thread with the server...");
+
+            // 2) Wait for Registered to get client_id
+            let client_id = loop {
+                match sim.recv()? {
+                    ServerMsg {
+                        msg: Some(server_msg::Msg::Registered(RegisterResponse { client_id })),
+                    } => break client_id,
+                    _ => {} // ignore until we see Registered
+                }
+            };
+
+            println!(
+                "[Client: {client_id}] Registered step thread with the server and received RegisterResponse"
+            );
+
+            #[allow(unused_assignments)]
+
+            // 3) Main step loop
+            loop {
+                sim.send(ClientMsg {
+                    msg: Some(client_msg::Msg::StepReady(StepReady {
+                        client_id,
+                        tick_seq: 0,
+                    })),
+                })?;
+
+                // wait for the step to advance (block until Tick)
+                loop {
+                    match sim.recv()? {
+                        ServerMsg {
+                            msg: Some(server_msg::Msg::Tick(t)),
+                        } => {
+                            break;
+                        }
+                        _ => { /* ignore other messages */ }
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(work_ms));
+            }
+        })
+        .expect("spawn controller thread")
+}
+
+/// Connect a thread which just calls StepReady on the remote server, acting as a contributing client with no "work".
+pub fn connect_remote_stepper(
+    addr: &str,
+    name: &str,
+    work_ms: u64,
+) -> thread::JoinHandle<Result<()>> {
+    let remote_client = connect_remote(&addr);
+    spawn_step_thread(
+        name,
+        work_ms,
+        remote_client.expect("connect to remote failed"),
+    )
 }

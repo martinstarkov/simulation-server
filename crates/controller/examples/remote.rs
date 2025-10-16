@@ -14,18 +14,10 @@ fn main() -> Result<()> {
 
     let addr = "127.0.0.1:50051";
 
-    let _server = create_server(ServerMode::WithGrpc(addr.to_string()));
+    let client = connect_remote(&addr)?;
 
-    thread::sleep(Duration::from_millis(100));
+    let h = spawn_controller_thread("ctrl-A", 500000, 40, client);
 
-    let client_a = connect_remote(&addr)?;
-    let client_b = connect_remote(&addr)?;
-
-    let h1 = spawn_controller_thread("ctrl-A", 5, 40, client_a);
-
-    let h2 = spawn_controller_thread("ctrl-B", 5, 600, client_b);
-
-    h1.join().unwrap()?;
-    h2.join().unwrap()?;
+    h.join().unwrap()?;
     Ok(())
 }
