@@ -11,5 +11,5 @@ bevy = { version = "0.17", default-features = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
 interface = { workspace = true }
-server = { workspace = true }
-client = { workspace = true }
+bridge = { workspace = true }
+simulator = { workspace = true }

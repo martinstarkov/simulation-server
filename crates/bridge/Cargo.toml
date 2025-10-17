@@ -1,5 +1,5 @@
 [package]
-name = "server"
+name = "bridge"
 authors = ["Martin Starkov"]
 version = "0.1.0"
 edition.workspace = true

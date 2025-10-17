@@ -1,6 +1,7 @@
 use anyhow::Result;
+use bridge::server::Server;
 use clap::Parser;
-use server::{create_local_server, create_remote_server};
+use simulator::MySim;
 use std::thread;
 use std::time::Duration;
 use tracing::info;
@@ -29,8 +30,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.local {
-        info!("[Server] Starting in local mode (no gRPC)");
-        let _server = create_local_server();
+        info!("[Server] Starting in local mode (without gRPC)");
+        let _server = Server::new_without_grpc(MySim::default());
         // keep alive forever
         loop {
             thread::sleep(Duration::from_secs(3600));
@@ -38,7 +39,7 @@ async fn main() -> Result<()> {
     } else {
         let addr = args.addr;
         info!("[Server] Starting with gRPC on {addr}");
-        let _server = create_remote_server(&addr);
+        let _server = Server::new_with_grpc(&addr, MySim::default());
         // keep alive forever
         loop {
             thread::sleep(Duration::from_secs(3600));
