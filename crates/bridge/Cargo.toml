@@ -18,5 +18,6 @@ prost-types = { workspace = true }
 tracing = { workspace = true }
 interface = { workspace = true }
 simulator = { workspace = true }
+dashmap = "6.1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive"] }

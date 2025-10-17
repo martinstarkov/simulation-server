@@ -75,9 +75,16 @@ message ServerMsg {
   }
 }
 
+message RegisterRequest {}
+
+message RegisterResponse {
+  uint64 client_id = 1;
+}
+
 // ---------- Service ----------
 
 service Forwarder {
   // Primary bidi stream. Clients send ClientMsg; server pushes ServerMsg.
   rpc Open(stream ClientMsg) returns (stream ServerMsg);
+  rpc Register(RegisterRequest) returns (RegisterResponse);
 }

@@ -1,5 +1,8 @@
 pub mod client;
+pub mod local;
+pub mod remote;
 pub mod server;
+pub mod service;
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
