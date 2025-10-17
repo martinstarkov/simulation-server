@@ -13,4 +13,8 @@ impl Simulation for MySim {
             })),
         }])
     }
+
+    fn dt(&self) -> f32 {
+        1.0 / 60.0
+    }
 }

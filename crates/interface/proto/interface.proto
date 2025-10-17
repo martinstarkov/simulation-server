@@ -21,7 +21,7 @@ message StepReady {}
 // Monotonic simulation step marker.
 message Tick {
   uint64 seq     = 1;  // step sequence (0..N)
-  int64  time_ns = 2;  // simulation time in nanoseconds (optional; 0 if unused)
+  float  time_s = 2;  // seconds since simulation started (dt * seq)
 }
 
 // Optional: full observation/state snapshot pushed or returned via unary.
@@ -94,12 +94,5 @@ message ServerMsg {
 
 service Simulator {
   // Primary bidi stream. Clients send ClientMsg; server pushes ServerMsg.
-  // Typical flows:
-  //   - Contributing: Register(contrib=true) → loop { StepReady → server pushes Tick (+ optional state) }
-  //   - Non-contrib:  Register(contrib=false) → server may push Tick/State as it advances.
   rpc Open(stream ClientMsg) returns (stream ServerMsg);
-
-  // Optional unary helpers for pull-based clients (e.g., viewers polling state).
-  rpc GetLatestTick (google.protobuf.Empty) returns (Tick);
-  rpc GetLatestState(google.protobuf.Empty) returns (Observation);
 }

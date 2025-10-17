@@ -1,8 +1,8 @@
 use bevy::prelude::*;
 use crossbeam_channel as xchan;
-use interface::{ServerMsg, ServerMsgBody};
+use interface::{ServerMsg, ServerMsgBody, Tick};
 
-const TARGET_FPS: f64 = 1.0;
+const TARGET_FPS: f64 = 60.0;
 
 #[derive(Resource)]
 struct FpsLimiter(Timer);
@@ -20,11 +20,14 @@ pub struct SimObject {
 
 #[derive(Resource, Default)]
 pub struct SimState {
-    pub tick: u64, // newest tick from the server
+    pub tick: Tick, // newest tick from the server
 }
 
 #[derive(Component)]
 pub struct TickText;
+
+#[derive(Component)]
+pub struct TimeText;
 
 pub fn run_bevy(rx_app: xchan::Receiver<ServerMsg>, tx_done: xchan::Sender<()>) {
     App::new()
@@ -97,6 +100,7 @@ fn setup_ui(mut commands: Commands, _asset_server: Res<AssetServer>) {
                 position_type: PositionType::Absolute,
                 top: Val::Px(10.0),
                 left: Val::Px(10.0),
+                flex_direction: FlexDirection::Column,
                 ..default()
             },
             BackgroundColor(Color::NONE),
@@ -112,6 +116,16 @@ fn setup_ui(mut commands: Commands, _asset_server: Res<AssetServer>) {
                 TextColor(Color::srgb(1.0, 0.84, 0.0)), // “gold”-ish color
                 TickText,
             ));
+            parent.spawn((
+                Text::new("Time: 0.0 s"),
+                TextFont {
+                    font: default(),
+                    font_size: 24.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.9, 0.9, 1.0)),
+                TimeText,
+            ));
         });
 }
 
@@ -123,7 +137,7 @@ fn drain_inbox(
     for msg in inbox.0.try_iter() {
         match msg.body {
             Some(ServerMsgBody::Tick(t)) => {
-                state.tick = t.seq;
+                state.tick = t;
                 println!("Received tick: {}", t.seq);
             }
             Some(ServerMsgBody::State(_obs)) => {
@@ -137,8 +151,17 @@ fn drain_inbox(
     }
 }
 
-fn update_tick_ui(state: Res<SimState>, mut query: Query<&mut Text, With<TickText>>) {
-    if let Ok(mut text) = query.single_mut() {
-        text.0 = format!("Tick: {}", state.tick);
+fn update_tick_ui(
+    state: Res<SimState>,
+    mut sets: ParamSet<(
+        Query<&mut Text, With<TickText>>,
+        Query<&mut Text, With<TimeText>>,
+    )>,
+) {
+    if let Ok(mut text) = sets.p0().single_mut() {
+        text.0 = format!("Tick: {}", state.tick.seq);
+    }
+    if let Ok(mut text) = sets.p1().single_mut() {
+        text.0 = format!("Time: {:.1} s", state.tick.time_s);
     }
 }

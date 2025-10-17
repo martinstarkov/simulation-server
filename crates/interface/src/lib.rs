@@ -10,6 +10,8 @@ pub use server_msg::Body as ServerMsgBody;
 pub trait Simulation: Send + Sync + 'static {
     /// Handle a message; return any responses to broadcast to clients.
     fn handle_message(&mut self, body: ClientMsg) -> anyhow::Result<Vec<ServerMsg>>;
+
+    fn dt(&self) -> f32;
 }
 
 #[derive(Clone, Debug)]

@@ -21,9 +21,9 @@ pub struct Tick {
     /// step sequence (0..N)
     #[prost(uint64, tag = "1")]
     pub seq: u64,
-    /// simulation time in nanoseconds (optional; 0 if unused)
-    #[prost(int64, tag = "2")]
-    pub time_ns: i64,
+    /// seconds since simulation started (dt * seq)
+    #[prost(float, tag = "2")]
+    pub time_s: f32,
 }
 /// Optional: full observation/state snapshot pushed or returned via unary.
 /// Define to match your sim. A common pattern is a flat list of objects.
@@ -230,9 +230,6 @@ pub mod simulator_client {
             self
         }
         /// Primary bidi stream. Clients send ClientMsg; server pushes ServerMsg.
-        /// Typical flows:
-        ///   - Contributing: Register(contrib=true) → loop { StepReady → server pushes Tick (+ optional state) }
-        ///   - Non-contrib:  Register(contrib=false) → server may push Tick/State as it advances.
         pub async fn open(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::ClientMsg>,
@@ -253,49 +250,6 @@ pub mod simulator_client {
             let mut req = request.into_streaming_request();
             req.extensions_mut().insert(GrpcMethod::new("interface.Simulator", "Open"));
             self.inner.streaming(req, path, codec).await
-        }
-        /// Optional unary helpers for pull-based clients (e.g., viewers polling state).
-        pub async fn get_latest_tick(
-            &mut self,
-            request: impl tonic::IntoRequest<()>,
-        ) -> std::result::Result<tonic::Response<super::Tick>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/interface.Simulator/GetLatestTick",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("interface.Simulator", "GetLatestTick"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn get_latest_state(
-            &mut self,
-            request: impl tonic::IntoRequest<()>,
-        ) -> std::result::Result<tonic::Response<super::Observation>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/interface.Simulator/GetLatestState",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("interface.Simulator", "GetLatestState"));
-            self.inner.unary(req, path, codec).await
         }
     }
 }
@@ -319,22 +273,10 @@ pub mod simulator_server {
             + std::marker::Send
             + 'static;
         /// Primary bidi stream. Clients send ClientMsg; server pushes ServerMsg.
-        /// Typical flows:
-        ///   - Contributing: Register(contrib=true) → loop { StepReady → server pushes Tick (+ optional state) }
-        ///   - Non-contrib:  Register(contrib=false) → server may push Tick/State as it advances.
         async fn open(
             &self,
             request: tonic::Request<tonic::Streaming<super::ClientMsg>>,
         ) -> std::result::Result<tonic::Response<Self::OpenStream>, tonic::Status>;
-        /// Optional unary helpers for pull-based clients (e.g., viewers polling state).
-        async fn get_latest_tick(
-            &self,
-            request: tonic::Request<()>,
-        ) -> std::result::Result<tonic::Response<super::Tick>, tonic::Status>;
-        async fn get_latest_state(
-            &self,
-            request: tonic::Request<()>,
-        ) -> std::result::Result<tonic::Response<super::Observation>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SimulatorServer<T> {
@@ -452,86 +394,6 @@ pub mod simulator_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.streaming(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/interface.Simulator/GetLatestTick" => {
-                    #[allow(non_camel_case_types)]
-                    struct GetLatestTickSvc<T: Simulator>(pub Arc<T>);
-                    impl<T: Simulator> tonic::server::UnaryService<()>
-                    for GetLatestTickSvc<T> {
-                        type Response = super::Tick;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(&mut self, request: tonic::Request<()>) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Simulator>::get_latest_tick(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = GetLatestTickSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/interface.Simulator/GetLatestState" => {
-                    #[allow(non_camel_case_types)]
-                    struct GetLatestStateSvc<T: Simulator>(pub Arc<T>);
-                    impl<T: Simulator> tonic::server::UnaryService<()>
-                    for GetLatestStateSvc<T> {
-                        type Response = super::Observation;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(&mut self, request: tonic::Request<()>) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Simulator>::get_latest_state(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = GetLatestStateSvc(inner);
-                        let codec = tonic::codec::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

@@ -103,6 +103,8 @@ impl<S: Simulation> Coordinator<S> {
     pub fn spawn(sim: Arc<Mutex<S>>) -> Coordinator<S> {
         let (tx, rx) = xchan::unbounded::<Cmd<S>>();
 
+        let dt = sim.lock().unwrap().dt();
+
         std::thread::spawn(move || {
             #[derive(Default)]
             struct State {
@@ -114,6 +116,7 @@ impl<S: Simulation> Coordinator<S> {
             }
 
             let mut st = State::default();
+
             while let Ok(cmd) = rx.recv() {
                 match cmd {
                     Cmd::Register {
@@ -144,7 +147,7 @@ impl<S: Simulation> Coordinator<S> {
                             st.tick_seq += 1;
                             let tick = Tick {
                                 seq: st.tick_seq,
-                                time_ns: 0,
+                                time_s: (st.tick_seq as f32) * dt,
                             };
                             info!("[Server] Stepped forward to tick: {}", st.tick_seq);
                             for tx in st.client_out.values() {
@@ -289,13 +292,5 @@ impl<S: Simulation> Simulator for SimSvc<S> {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn get_latest_tick(&self, _req: Request<()>) -> Result<Response<Tick>, Status> {
-        Ok(Response::new(Tick { seq: 0, time_ns: 0 }))
-    }
-
-    async fn get_latest_state(&self, _req: Request<()>) -> Result<Response<Observation>, Status> {
-        Err(Status::unimplemented("no state API"))
     }
 }
