@@ -8,7 +8,6 @@ import "google/protobuf/empty.proto";
 
 // Identify a client on registration.
 message RegisterRequest {
-  string client_name = 1;
   bool   contributing = 2; // if true, this client participates in the step barrier
 }
 
@@ -17,12 +16,7 @@ message RegisterResponse {
 }
 
 // Barrier signal from a contributing client.
-// `tick_seq` can be used by advanced clients to indicate which tick they believe
-// they’re ready for; servers may ignore it if not needed.
-message StepReady {
-  uint64 client_id = 1;
-  uint64 tick_seq  = 2;
-}
+message StepReady {}
 
 // Monotonic simulation step marker.
 message Tick {
@@ -76,17 +70,19 @@ message ErrorMsg {
 // ---------- Envelopes (wire format) ----------
 
 message ClientMsg {
-  oneof msg {
-    RegisterRequest register     = 1;
-    StepReady       step_ready   = 2;
-    ControlOutput   control      = 3;
-    ParamUpdate     param_update = 4;
-    ResetCommand    reset        = 5;
+  uint64 client_id = 1;
+
+  oneof body {
+    RegisterRequest register     = 2;
+    StepReady       step_ready   = 3;
+    ControlOutput   control      = 4;
+    ParamUpdate     param_update = 5;
+    ResetCommand    reset        = 6;
   }
 }
 
 message ServerMsg {
-  oneof msg {
+  oneof body {
     RegisterResponse registered = 1;
     Tick             tick       = 2;
     Observation      state      = 3; // optional push; servers may also expose unary GetLatestState

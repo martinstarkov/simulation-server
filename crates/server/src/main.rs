@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use interface::ServerMode;
-use server::create_server;
+use server::{create_local_server, create_remote_server};
 use std::thread;
 use std::time::Duration;
 use tracing::info;
@@ -30,16 +29,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.local {
-        info!("Starting simulator in LOCAL-ONLY mode (no gRPC)");
-        let _server = create_server(ServerMode::LocalOnly);
+        info!("[Server] Starting in local mode (no gRPC)");
+        let _server = create_local_server();
         // keep alive forever
         loop {
             thread::sleep(Duration::from_secs(3600));
         }
     } else {
         let addr = args.addr;
-        info!("Starting simulator with gRPC on {addr}");
-        let _server = create_server(ServerMode::WithGrpc(addr));
+        info!("[Server] Starting with gRPC on {addr}");
+        let _server = create_remote_server(&addr);
         // keep alive forever
         loop {
             thread::sleep(Duration::from_secs(3600));

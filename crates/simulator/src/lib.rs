@@ -1,17 +1,14 @@
 use anyhow::Result;
-use interface::{
-    Simulation,
-    interface::{ClientMsg, ServerMsg, server_msg},
-};
+use interface::{ClientMsg, ErrorMsg, ServerMsg, ServerMsgBody, Simulation};
 use tracing::info;
 
 pub struct MySim;
 
 impl Simulation for MySim {
     fn handle_message(&mut self, msg: ClientMsg) -> Result<Vec<ServerMsg>> {
-        info!("Server received message: {:?}", msg);
+        info!("[Server] Received message: {:?}", msg);
         Ok(vec![ServerMsg {
-            msg: Some(server_msg::Msg::ErrorMsg(interface::interface::ErrorMsg {
+            body: Some(ServerMsgBody::ErrorMsg(ErrorMsg {
                 message: "OK".into(),
             })),
         }])

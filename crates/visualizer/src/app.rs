@@ -1,9 +1,6 @@
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
 use crossbeam_channel as xchan;
-use interface::interface::{ServerMsg, server_msg};
-
-use std::time::{Duration, Instant};
+use interface::{ServerMsg, ServerMsgBody};
 
 const TARGET_FPS: f64 = 1.0;
 
@@ -16,19 +13,14 @@ pub struct Inbox(pub xchan::Receiver<ServerMsg>);
 #[derive(Resource)]
 pub struct StepBarrier(pub xchan::Sender<()>);
 
-fn notify_worker_frame_done(barrier: Res<StepBarrier>) {
-    let _ = barrier.0.try_send(());
-}
-
 #[derive(Component)]
 pub struct SimObject {
-    pub id: u32,
+    pub _id: u32,
 }
 
 #[derive(Resource, Default)]
 pub struct SimState {
     pub tick: u64, // newest tick from the server
-    pub started: bool,
 }
 
 #[derive(Component)]
@@ -50,7 +42,6 @@ fn run_sim_logic(
     keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut limiter: ResMut<FpsLimiter>,
-    mut state: ResMut<SimState>,
     barrier: Res<StepBarrier>,
 ) {
     limiter.0.tick(time.delta());
@@ -91,14 +82,14 @@ fn setup_scene(
     });
 
     commands.spawn((
-        SimObject { id: 1 },
+        SimObject { _id: 1 },
         Mesh3d(mesh),
         MeshMaterial3d(material),
         Transform::from_xyz(0.0, 0.5, 0.0),
     ));
 }
 
-fn setup_ui(mut commands: Commands, asset_server: Res<AssetServer>) {
+fn setup_ui(mut commands: Commands, _asset_server: Res<AssetServer>) {
     // Root UI node
     commands
         .spawn((
@@ -130,12 +121,12 @@ fn drain_inbox(
     mut q: Query<(&SimObject, &mut Transform)>,
 ) {
     for msg in inbox.0.try_iter() {
-        match msg.msg {
-            Some(server_msg::Msg::Tick(t)) => {
+        match msg.body {
+            Some(ServerMsgBody::Tick(t)) => {
                 state.tick = t.seq;
                 println!("Received tick: {}", t.seq);
             }
-            Some(server_msg::Msg::State(_obs)) => {
+            Some(ServerMsgBody::State(_obs)) => {
                 println!("Received state");
                 for (_obj, mut _tf) in q.iter_mut() {
                     // TODO: update transform from sim state.

@@ -5,13 +5,10 @@
 mod app;
 mod worker;
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use app::run_bevy;
-use client::sync_client::{connect_local, connect_remote, connect_remote_stepper};
-use interface::ServerMode;
-use server::{create_server, init_tracing};
+use client::client::{connect_local, connect_remote, connect_remote_stepper};
+use server::{create_local_server, create_remote_server, init_tracing};
 use worker::spawn_viewer_worker;
 
 /// How to run the visualizer.
@@ -45,11 +42,11 @@ pub fn run(mode: VisualizerMode) -> Result<()> {
         // --------------------------
         VisualizerMode::LocalBlockingWithServer => {
             // keep server alive for Bevy's lifetime
-            let server = Arc::new(create_server(ServerMode::LocalOnly));
+            let server = create_local_server();
 
-            let client = connect_local(&Arc::clone(&server))?;
+            let client = connect_local(true, &server)?;
 
-            let (rx_app, tx_done) = spawn_viewer_worker("viewer-contrib-local", true, client);
+            let (rx_app, tx_done) = spawn_viewer_worker(client);
 
             run_bevy(rx_app, tx_done);
         }
@@ -58,12 +55,11 @@ pub fn run(mode: VisualizerMode) -> Result<()> {
         // REMOTE (blocking, spawns server)
         // --------------------------
         VisualizerMode::RemoteBlockingWithServer { addr } => {
-            let _server = create_server(ServerMode::WithGrpc(addr.to_string()));
+            let _server = create_remote_server(&addr);
 
-            let client = connect_remote(&addr)?;
+            let client = connect_remote(true, &addr)?;
 
-            let (rx_app, tx_done) =
-                spawn_viewer_worker("viewer-contrib-remote-local", true, client);
+            let (rx_app, tx_done) = spawn_viewer_worker(client);
 
             run_bevy(rx_app, tx_done);
 
@@ -74,13 +70,12 @@ pub fn run(mode: VisualizerMode) -> Result<()> {
         // REMOTE (non-blocking, spawns server)
         // --------------------------
         VisualizerMode::RemoteNonBlockingWithServer { addr } => {
-            let _server = create_server(ServerMode::WithGrpc(addr.to_string()));
-            let client = connect_remote(&addr)?;
+            let _server = create_remote_server(&addr);
+            let client = connect_remote(false, &addr)?;
 
-            let (rx_app, tx_done) =
-                spawn_viewer_worker("viewer-noncontrib-remote-local", false, client);
+            let (rx_app, tx_done) = spawn_viewer_worker(client);
 
-            let stepper = connect_remote_stepper(&addr, "stepper", 1);
+            let stepper = connect_remote_stepper(&addr, 1);
 
             run_bevy(rx_app, tx_done);
 
@@ -92,9 +87,9 @@ pub fn run(mode: VisualizerMode) -> Result<()> {
         // REMOTE (non-blocking)
         // --------------------------
         VisualizerMode::RemoteNonBlocking { addr } => {
-            let client = connect_remote(&addr)?;
+            let client = connect_remote(false, &addr)?;
 
-            let (rx_app, tx_done) = spawn_viewer_worker("viewer-noncontrib", false, client);
+            let (rx_app, tx_done) = spawn_viewer_worker(client);
 
             run_bevy(rx_app, tx_done);
         }
@@ -103,9 +98,9 @@ pub fn run(mode: VisualizerMode) -> Result<()> {
         // REMOTE (blocking)
         // --------------------------
         VisualizerMode::RemoteBlocking { addr } => {
-            let client = connect_remote(&addr)?;
+            let client = connect_remote(true, &addr)?;
 
-            let (rx_app, tx_done) = spawn_viewer_worker("viewer-contrib", true, client);
+            let (rx_app, tx_done) = spawn_viewer_worker(client);
 
             run_bevy(rx_app, tx_done);
         }

@@ -25,3 +25,11 @@ pub fn create_server(mode: ServerMode) -> SimServer<MySim> {
     let sim = Arc::new(Mutex::new(MySim));
     create_custom_server(mode, sim)
 }
+
+pub fn create_local_server() -> Arc<SimServer<MySim>> {
+    Arc::new(create_server(ServerMode::LocalOnly))
+}
+
+pub fn create_remote_server(addr: &str) -> SimServer<MySim> {
+    create_server(ServerMode::WithGrpc(addr.to_string()))
+}

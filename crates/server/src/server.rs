@@ -1,10 +1,8 @@
 use crossbeam_channel as xchan;
 use interface::{
-    ServerMode, Simulation,
-    interface::{
-        ClientMsg, ServerMsg, Tick, server_msg,
-        simulator_server::{Simulator, SimulatorServer},
-    },
+    ClientMsg, ClientMsgBody, ErrorMsg, Observation, RegisterResponse, ServerMode, ServerMsg,
+    ServerMsgBody, Simulation, Tick,
+    simulator_server::{Simulator, SimulatorServer},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -53,19 +51,17 @@ pub fn create_custom_server<S: Simulation>(mode: ServerMode, sim: Arc<Mutex<S>>)
         ServerMode::WithGrpc(addr) => {
             let coord = server.coord.clone();
 
-            let _join = thread::Builder::new()
-                .name("grpc-server".into())
-                .spawn(move || {
-                    safe_block_on(async move {
-                        info!("starting gRPC server on {addr}");
-                        let svc = SimSvc { coord };
-                        tonic::transport::Server::builder()
-                            .add_service(SimulatorServer::new(svc))
-                            .serve(addr.parse().unwrap())
-                            .await
-                            .unwrap();
-                    });
+            let _join = thread::spawn(move || {
+                safe_block_on(async move {
+                    info!("[Server] Starting with gRPC on {addr}");
+                    let svc = SimSvc { coord };
+                    tonic::transport::Server::builder()
+                        .add_service(SimulatorServer::new(svc))
+                        .serve(addr.parse().unwrap())
+                        .await
+                        .unwrap();
                 });
+            });
 
             server
         }
@@ -87,7 +83,6 @@ impl<S: Simulation> Clone for Coordinator<S> {
 
 enum Cmd<S: Simulation> {
     Register {
-        name: String,
         contributing: bool,
         reply: xchan::Sender<(u64, xchan::Receiver<ServerMsg>)>,
     },
@@ -98,7 +93,7 @@ enum Cmd<S: Simulation> {
         client_id: u64,
     },
     Message {
-        msg: ClientMsg,
+        body: ClientMsg,
     },
     Shutdown,
     _Phantom(std::marker::PhantomData<S>),
@@ -122,7 +117,6 @@ impl<S: Simulation> Coordinator<S> {
             while let Ok(cmd) = rx.recv() {
                 match cmd {
                     Cmd::Register {
-                        name: _,
                         contributing,
                         reply,
                         ..
@@ -134,7 +128,10 @@ impl<S: Simulation> Coordinator<S> {
                         if contributing {
                             st.contributing.insert(id);
                         }
-                        info!("Server registered client #{id} (contrib={})", contributing);
+                        info!(
+                            "[Server] Registered client #{id} (contrib={})",
+                            contributing
+                        );
                         let _ = reply.send((id, out_rx));
                     }
                     Cmd::StepReady { client_id } => {
@@ -149,18 +146,18 @@ impl<S: Simulation> Coordinator<S> {
                                 seq: st.tick_seq,
                                 time_ns: 0,
                             };
-                            info!("Server stepped forward to tick: {}", st.tick_seq);
+                            info!("[Server] Stepped forward to tick: {}", st.tick_seq);
                             for tx in st.client_out.values() {
                                 let _ = tx.send(ServerMsg {
-                                    msg: Some(server_msg::Msg::Tick(tick.clone())),
+                                    body: Some(ServerMsgBody::Tick(tick.clone())),
                                 });
                             }
                             st.ready.clear();
                         }
                     }
-                    Cmd::Message { msg, .. } => {
+                    Cmd::Message { body, .. } => {
                         // pass to simulation
-                        let responses = sim.lock().unwrap().handle_message(msg);
+                        let responses = sim.lock().unwrap().handle_message(body);
                         match responses {
                             Ok(resps) => {
                                 for r in resps {
@@ -173,28 +170,26 @@ impl<S: Simulation> Coordinator<S> {
                             Err(e) => {
                                 for tx in st.client_out.values() {
                                     let _ = tx.send(ServerMsg {
-                                        msg: Some(server_msg::Msg::ErrorMsg(
-                                            interface::interface::ErrorMsg {
-                                                message: format!("sim error: {e}"),
-                                            },
-                                        )),
+                                        body: Some(ServerMsgBody::ErrorMsg(ErrorMsg {
+                                            message: format!("sim error: {e}"),
+                                        })),
                                     });
                                 }
                             }
                         }
                     }
                     Cmd::Remove { client_id } => {
-                        info!("Server unregistered client #{client_id}");
+                        info!("[Server] Unregistered client #{client_id}");
                         st.contributing.remove(&client_id);
                         st.ready.remove(&client_id);
                         st.client_out.remove(&client_id);
                     }
                     Cmd::Shutdown => {
-                        info!("Server shutdown");
+                        info!("[Server] Shutdown");
                         break;
                     }
                     Cmd::_Phantom(_) => {
-                        panic!("Phantom server command");
+                        panic!("[Server] Phantom command");
                     }
                 }
             }
@@ -203,10 +198,9 @@ impl<S: Simulation> Coordinator<S> {
         Coordinator { tx }
     }
 
-    pub fn register(&self, name: &str, contributing: bool) -> (u64, xchan::Receiver<ServerMsg>) {
+    pub fn register(&self, contributing: bool) -> (u64, xchan::Receiver<ServerMsg>) {
         let (reply_tx, reply_rx) = xchan::bounded::<(u64, xchan::Receiver<ServerMsg>)>(1);
         let _ = self.tx.send(Cmd::Register {
-            name: name.into(),
             contributing,
             reply: reply_tx,
         });
@@ -217,8 +211,8 @@ impl<S: Simulation> Coordinator<S> {
         let _ = self.tx.send(Cmd::StepReady { client_id });
     }
 
-    pub fn send_message(&self, msg: ClientMsg) {
-        let _ = self.tx.send(Cmd::Message { msg });
+    pub fn send_message(&self, body: ClientMsg) {
+        let _ = self.tx.send(Cmd::Message { body });
     }
 
     pub fn remove(&self, client_id: u64) {
@@ -249,24 +243,26 @@ impl<S: Simulation> Simulator for SimSvc<S> {
         tokio::spawn(async move {
             let mut client_id: Option<u64> = None;
 
+            // TODO: Move these into a separate interface.
+
             while let Ok(Some(msg)) = inbound.message().await {
-                match msg.msg {
+                match msg.body {
                     // Contributing clients tick barrier
-                    Some(interface::interface::client_msg::Msg::StepReady(sr)) => {
-                        coord.step_ready(sr.client_id);
+                    Some(ClientMsgBody::StepReady(_sr)) => {
+                        coord.step_ready(msg.client_id);
                     }
 
                     // Registration: reply with Registered immediately, then forward coordinator stream
-                    Some(interface::interface::client_msg::Msg::Register(req)) => {
-                        let (id, out_rx) = coord.register(&req.client_name, req.contributing);
+                    Some(ClientMsgBody::Register(req)) => {
+                        let (id, out_rx) = coord.register(req.contributing);
                         client_id = Some(id);
 
                         // 1) Send Registered immediately so the client can proceed
                         let _ = tx
                             .send(Ok(ServerMsg {
-                                msg: Some(interface::interface::server_msg::Msg::Registered(
-                                    interface::interface::RegisterResponse { client_id: id },
-                                )),
+                                body: Some(ServerMsgBody::Registered(RegisterResponse {
+                                    client_id: id,
+                                })),
                             }))
                             .await;
 
@@ -299,10 +295,7 @@ impl<S: Simulation> Simulator for SimSvc<S> {
         Ok(Response::new(Tick { seq: 0, time_ns: 0 }))
     }
 
-    async fn get_latest_state(
-        &self,
-        _req: Request<()>,
-    ) -> Result<Response<interface::interface::Observation>, Status> {
+    async fn get_latest_state(&self, _req: Request<()>) -> Result<Response<Observation>, Status> {
         Err(Status::unimplemented("no state API"))
     }
 }
