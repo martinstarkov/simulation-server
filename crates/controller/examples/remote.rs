@@ -3,14 +3,14 @@
 
 use anyhow::Result;
 use bridge::{client::Client, init_tracing};
-use controller::common::spawn_controller_thread;
+use controller::spawn_controller_thread;
 
 fn main() -> Result<()> {
     init_tracing();
 
     let addr = "127.0.0.1:50051";
 
-    let client = Client::new_remote(true, &addr)?;
+    let client = Client::new_remote(true, addr)?;
 
     let h = spawn_controller_thread(500000, 40, client);
 

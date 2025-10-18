@@ -1,6 +1,7 @@
 use crossbeam_channel::Receiver as CbReceiver;
 use interface::{
-    ClientMsg, RegisterRequest, RegisterResponse, ServerMsg, forwarder_server::Forwarder,
+    ClientMsg, RegisterRequest, RegisterResponse, ServerMsg, Simulation,
+    forwarder_server::Forwarder,
 };
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -11,12 +12,12 @@ use crate::server::SharedServer;
 // -------------------- gRPC Service --------------------
 
 #[derive(Clone)]
-pub struct ForwarderService {
-    pub server: SharedServer,
+pub struct ForwarderService<S: Simulation> {
+    pub server: SharedServer<S>,
 }
 
 #[tonic::async_trait]
-impl Forwarder for ForwarderService {
+impl<S: Simulation> Forwarder for ForwarderService<S> {
     type OpenStream = ReceiverStream<Result<ServerMsg, Status>>;
 
     // --- Registration RPC ---
@@ -83,19 +84,15 @@ impl Forwarder for ForwarderService {
                             break;
                         }
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         //eprintln!("[server] client {} stream error: {:?}", client_id, e);
                         break;
                     }
                 }
             }
 
-            // Unregister when client disconnects
-            println!(
-                "[server] Remote client {} disconnected (inbound)",
-                client_id
-            );
-            server_ref.clients.remove(&client_id);
+            println!("[server] Client {} disconnected (inbound)", client_id);
+            server_ref.unregister_client(client_id);
         });
 
         // --- Outbound: server → client ---
@@ -114,12 +111,8 @@ impl Forwarder for ForwarderService {
                 }
             }
 
-            // Unregister client when stream closes
-            println!(
-                "[server] Remote client {} disconnected (outbound)",
-                client_id
-            );
-            server_ref.clients.remove(&client_id);
+            println!("[server] Client {} disconnected (outbound)", client_id);
+            server_ref.unregister_client(client_id);
         });
 
         Ok(Response::new(ReceiverStream::new(async_rx)))

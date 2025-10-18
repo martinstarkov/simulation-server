@@ -10,7 +10,6 @@ pub struct Tick {
     pub time_s: f32,
 }
 /// Optional: full observation/state snapshot pushed or returned via unary.
-/// Define to match your sim. A common pattern is a flat list of objects.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Observation {
     /// add more fields as needed (e.g., environment params)
@@ -48,10 +47,8 @@ pub struct Quat {
     pub w: f32,
 }
 /// Controller → Simulator command (per-step inputs).
-/// Put your torques/velocities/etc. inside.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlOutput {
-    /// example payloads; customize freely
     #[prost(message, repeated, tag = "1")]
     pub actuators: ::prost::alloc::vec::Vec<ActuatorCmd>,
 }
@@ -73,17 +70,24 @@ pub struct ParamUpdate {
 /// Reset the simulation (semantics are server-defined).
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ResetCommand {}
+/// Step synchronization command — sent by clients that participate
+/// in the stepping barrier (step_participant = true).
+/// When all such clients have sent StepReady, the server advances.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct StepReady {}
 /// Optional convenience for pushing error info down the stream.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ErrorMsg {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
 }
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct Shutdown {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientMsg {
     #[prost(uint64, tag = "1")]
     pub client_id: u64,
-    #[prost(oneof = "client_msg::Body", tags = "2, 3, 4")]
+    #[prost(oneof = "client_msg::Body", tags = "2, 3, 4, 5, 6")]
     pub body: ::core::option::Option<client_msg::Body>,
 }
 /// Nested message and enum types in `ClientMsg`.
@@ -96,6 +100,10 @@ pub mod client_msg {
         ParamUpdate(super::ParamUpdate),
         #[prost(message, tag = "4")]
         Reset(super::ResetCommand),
+        #[prost(message, tag = "5")]
+        StepReady(super::StepReady),
+        #[prost(message, tag = "6")]
+        Shutdown(super::Shutdown),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -109,7 +117,7 @@ pub mod server_msg {
     pub enum Body {
         #[prost(message, tag = "1")]
         Tick(super::Tick),
-        /// optional push; servers may also expose unary GetLatestState
+        /// optional push
         #[prost(message, tag = "2")]
         State(super::Observation),
         #[prost(message, tag = "3")]
@@ -118,6 +126,7 @@ pub mod server_msg {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct RegisterRequest {
+    /// if true, server waits for StepReady before stepping
     #[prost(bool, tag = "1")]
     pub step_participant: bool,
 }
@@ -239,6 +248,7 @@ pub mod forwarder_client {
             req.extensions_mut().insert(GrpcMethod::new("interface.Forwarder", "Open"));
             self.inner.streaming(req, path, codec).await
         }
+        /// Registration RPC (returns client_id)
         pub async fn register(
             &mut self,
             request: impl tonic::IntoRequest<super::RegisterRequest>,
@@ -289,6 +299,7 @@ pub mod forwarder_server {
             &self,
             request: tonic::Request<tonic::Streaming<super::ClientMsg>>,
         ) -> std::result::Result<tonic::Response<Self::OpenStream>, tonic::Status>;
+        /// Registration RPC (returns client_id)
         async fn register(
             &self,
             request: tonic::Request<super::RegisterRequest>,

@@ -8,12 +8,11 @@ import "google/protobuf/empty.proto";
 
 // Monotonic simulation step marker.
 message Tick {
-  uint64 seq     = 1;  // step sequence (0..N)
-  float  time_s = 2;  // seconds since simulation started (dt * seq)
+  uint64 seq   = 1;  // step sequence (0..N)
+  float  time_s = 2; // seconds since simulation started (dt * seq)
 }
 
 // Optional: full observation/state snapshot pushed or returned via unary.
-// Define to match your sim. A common pattern is a flat list of objects.
 message Observation {
   repeated Object objects = 1;
   // add more fields as needed (e.g., environment params)
@@ -30,9 +29,7 @@ message Vec3 { float x = 1; float y = 2; float z = 3; }
 message Quat { float x = 1; float y = 2; float z = 3; float w = 4; }
 
 // Controller → Simulator command (per-step inputs).
-// Put your torques/velocities/etc. inside.
 message ControlOutput {
-  // example payloads; customize freely
   repeated ActuatorCmd actuators = 1;
 }
 
@@ -50,10 +47,17 @@ message ParamUpdate {
 // Reset the simulation (semantics are server-defined).
 message ResetCommand {}
 
+// Step synchronization command — sent by clients that participate
+// in the stepping barrier (step_participant = true).
+// When all such clients have sent StepReady, the server advances.
+message StepReady {}
+
 // Optional convenience for pushing error info down the stream.
 message ErrorMsg {
   string message = 1;
 }
+
+message Shutdown {}
 
 // ---------- Envelopes (wire format) ----------
 
@@ -64,19 +68,21 @@ message ClientMsg {
     ControlOutput   control      = 2;
     ParamUpdate     param_update = 3;
     ResetCommand    reset        = 4;
+    StepReady       step_ready   = 5;
+    Shutdown        shutdown     = 6;
   }
 }
 
 message ServerMsg {
   oneof body {
-    Tick tick = 1;
-    Observation      state      = 2; // optional push; servers may also expose unary GetLatestState
-    ErrorMsg         error_msg  = 3;
+    Tick            tick       = 1;
+    Observation     state      = 2; // optional push
+    ErrorMsg        error_msg  = 3;
   }
 }
 
 message RegisterRequest {
-  bool step_participant = 1;
+  bool step_participant = 1; // if true, server waits for StepReady before stepping
 }
 
 message RegisterResponse {
@@ -88,5 +94,7 @@ message RegisterResponse {
 service Forwarder {
   // Primary bidi stream. Clients send ClientMsg; server pushes ServerMsg.
   rpc Open(stream ClientMsg) returns (stream ServerMsg);
+
+  // Registration RPC (returns client_id)
   rpc Register(RegisterRequest) returns (RegisterResponse);
 }
