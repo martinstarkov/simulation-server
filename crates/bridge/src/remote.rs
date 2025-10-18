@@ -1,12 +1,15 @@
 use crate::client::Client;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use interface::{
     ClientMsg, ClientMsgBody, RegisterRequest, ServerMsg, forwarder_client::ForwarderClient,
 };
+use std::str::FromStr;
 use std::thread;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
+use tonic::metadata::MetadataValue;
 
 pub fn safe_block_on<F: std::future::Future>(fut: F) -> F::Output {
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -22,65 +25,90 @@ pub fn safe_block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-/// RemoteClient that provides a *synchronous* API using crossbeam channels,
-/// and a single background thread that forwards messages to/from gRPC.
 pub struct RemoteClient {
-    client_id: u64,
     to_server: Sender<ClientMsg>,
     from_server: Receiver<ServerMsg>,
 }
 
 impl RemoteClient {
-    pub fn connect(addr: &str) -> anyhow::Result<Self> {
-        // crossbeam channels for synchronous user API
+    /// Connect to a **remote** gRPC server at the given address.
+    ///
+    /// You can pass either:
+    /// - `"127.0.0.1:50051"` → automatically becomes `"http://127.0.0.1:50051"`
+    /// - `"http://127.0.0.1:50051"` → used as is
+    /// Connect to a **remote** gRPC server at the given address
+    pub fn new(step_participant: bool, addr: &str) -> Result<Self> {
         let (user_tx, user_rx) = unbounded::<ClientMsg>(); // user → server
         let (srv_tx, srv_rx) = unbounded::<ServerMsg>(); // server → user
 
-        // Start background thread that owns a Tokio runtime
-        let addr_str = addr.to_string();
-        let srv_tx_clone = srv_tx.clone();
+        let addr_str = if addr.starts_with("http://") || addr.starts_with("https://") {
+            addr.to_string()
+        } else {
+            format!("http://{}", addr)
+        };
 
+        // Background thread that owns the async runtime
         thread::spawn(move || {
-            safe_block_on(async move {
-                // Connect to gRPC
-                let mut grpc = ForwarderClient::connect(addr_str).await.unwrap();
-
-                // Register and get client_id
-                let resp = grpc
-                    .register(Request::new(RegisterRequest {}))
+            let _ = safe_block_on(async move {
+                let mut grpc = ForwarderClient::connect(addr_str)
                     .await
-                    .unwrap();
-                let client_id = resp.into_inner().client_id.clone();
+                    .expect("connect failed");
 
-                let (tx_async, rx_async) = tokio::sync::mpsc::channel::<ClientMsg>(32);
-                let cid = client_id.clone();
+                // Register with the server → server assigns client_id
+                let resp = grpc
+                    .register(Request::new(RegisterRequest { step_participant }))
+                    .await
+                    .expect("register failed")
+                    .into_inner();
+
+                let client_id = resp.client_id;
+                println!("[remote-client] registered with id {}", client_id);
+
+                // Bridge: crossbeam user_rx → async mpsc
+                let (tx_async, rx_async) = tokio::sync::mpsc::channel::<ClientMsg>(64);
                 let user_rx_clone = user_rx.clone();
-
-                // One blocking thread that forwards from crossbeam → async mpsc
                 std::thread::spawn(move || {
-                    for payload in user_rx_clone.iter() {
-                        let _ = tx_async.blocking_send(payload);
+                    for mut msg in user_rx_clone.iter() {
+                        // Fill in client_id automatically before sending
+                        msg.client_id = client_id;
+                        if tx_async.blocking_send(msg).is_err() {
+                            break;
+                        }
                     }
+                    println!("[remote-client] input bridge closed");
                 });
 
                 let outbound = ReceiverStream::new(rx_async);
 
-                // Start bidirectional stream
-                let mut inbound = grpc
-                    .open(Request::new(outbound))
-                    .await
-                    .unwrap()
-                    .into_inner();
+                // Attach client_id metadata
+                let mut req = Request::new(outbound);
+                req.metadata_mut().insert(
+                    "client-id",
+                    MetadataValue::from_str(&client_id.to_string()).unwrap(),
+                );
 
-                // Receive responses from server and push into crossbeam channel
-                while let Some(Ok(msg)) = inbound.next().await.map(|r| r.map_err(|_| ())) {
-                    let _ = srv_tx_clone.send(msg);
+                // Open the bidirectional stream
+                let mut inbound = grpc.open(req).await.unwrap().into_inner();
+
+                // Bridge inbound messages (server → client)
+                while let Some(result) = inbound.next().await {
+                    match result {
+                        Ok(msg) => {
+                            let _ = srv_tx.send(msg);
+                        }
+                        Err(status) => {
+                            eprintln!("[remote-client] stream error: {:?}", status);
+                            break;
+                        }
+                    }
                 }
+
+                println!("[remote-client] disconnected (id={})", client_id);
+                Ok::<(), anyhow::Error>(())
             });
         });
 
         Ok(Self {
-            client_id: 0, // not needed externally
             to_server: user_tx,
             from_server: srv_rx,
         })
@@ -90,7 +118,7 @@ impl RemoteClient {
 impl Client for RemoteClient {
     fn send(&self, body: ClientMsgBody) {
         let _ = self.to_server.send(ClientMsg {
-            client_id: self.client_id,
+            client_id: 0, // Filled automatically by forwarder service.
             body: Some(body),
         });
     }
@@ -98,13 +126,18 @@ impl Client for RemoteClient {
     fn recv(&self) -> Result<ServerMsg> {
         self.from_server
             .recv()
-            .map_err(|e| anyhow::anyhow!("failed to receive from server: {}", e))
+            .map_err(|e| anyhow!("receive failed: {}", e))
     }
 
     fn try_recv(&self) -> Option<ServerMsg> {
-        self.from_server
-            .try_recv()
-            .map_err(|e| anyhow::anyhow!("failed to receive from server: {}", e))
-            .ok()
+        self.from_server.try_recv().ok()
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = ServerMsg> + '_> {
+        Box::new(self.from_server.iter().map(|msg| msg))
+    }
+
+    fn try_iter(&self) -> Box<dyn Iterator<Item = ServerMsg> + '_> {
+        Box::new(self.from_server.try_iter().map(|msg| msg))
     }
 }

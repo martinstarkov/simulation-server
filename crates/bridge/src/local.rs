@@ -1,12 +1,8 @@
-use std::sync::Arc;
-
-use crate::{client::Client, server::Server};
-use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use interface::{ClientMsg, ClientMsgBody, ServerMsg};
 
-/// Fully synchronous in-process client that communicates directly
-/// with the `Server` via its crossbeam channels.
+use crate::{client::Client, server::SharedServer};
+
 pub struct LocalClient {
     client_id: u64,
     to_server: Sender<ClientMsg>,
@@ -14,17 +10,13 @@ pub struct LocalClient {
 }
 
 impl LocalClient {
-    /// Create a new local client connected directly to the given server.
-    ///
-    /// The client_id must be unique within the server.
-    pub fn new(server: Arc<Server>, client_id: u64) -> Self {
-        let to_server = server.inbound_tx();
-        let from_server = server.register_client(client_id);
-        Self {
+    pub fn new(server: &SharedServer, step_participant: bool) -> anyhow::Result<Self> {
+        let (client_id, to_server, from_server) = server.register_client(step_participant);
+        Ok(Self {
             client_id,
             to_server,
             from_server,
-        }
+        })
     }
 }
 
@@ -36,16 +28,21 @@ impl Client for LocalClient {
         });
     }
 
-    fn recv(&self) -> Result<ServerMsg> {
+    fn recv(&self) -> anyhow::Result<ServerMsg> {
         self.from_server
             .recv()
             .map_err(|e| anyhow::anyhow!("failed to receive from server: {}", e))
     }
 
     fn try_recv(&self) -> Option<ServerMsg> {
-        self.from_server
-            .try_recv()
-            .map_err(|e| anyhow::anyhow!("failed to receive from server: {}", e))
-            .ok()
+        self.from_server.try_recv().ok()
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = ServerMsg> + '_> {
+        Box::new(self.from_server.iter().map(|msg| msg))
+    }
+
+    fn try_iter(&self) -> Box<dyn Iterator<Item = ServerMsg> + '_> {
+        Box::new(self.from_server.try_iter().map(|msg| msg))
     }
 }

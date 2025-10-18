@@ -75,7 +75,9 @@ message ServerMsg {
   }
 }
 
-message RegisterRequest {}
+message RegisterRequest {
+  bool step_participant = 1;
+}
 
 message RegisterResponse {
   uint64 client_id = 1;

@@ -1,82 +1,127 @@
-use interface::forwarder_server::{Forwarder, ForwarderServer};
-use interface::{ClientMsg, RegisterRequest, RegisterResponse, ServerMsg};
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
-use tokio_stream::Stream;
+use crossbeam_channel::Receiver as CbReceiver;
+use interface::{
+    ClientMsg, RegisterRequest, RegisterResponse, ServerMsg, forwarder_server::Forwarder,
+};
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Server as GrpcServer;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
-use crate::server::Server;
+use crate::server::SharedServer;
 
-/// Async tonic service that bridges gRPC messages into the synchronous `Server`.
+// -------------------- gRPC Service --------------------
+
 #[derive(Clone)]
-pub struct ForwarderSvc {
-    server: Arc<Server>,
-}
-
-impl ForwarderSvc {
-    pub fn new(server: Arc<Server>) -> Self {
-        Self { server }
-    }
-
-    /// Start the gRPC server and serve this service.
-    pub async fn run(self, addr: SocketAddr) {
-        GrpcServer::builder()
-            .add_service(ForwarderServer::new(self))
-            .serve(addr)
-            .await
-            .unwrap();
-    }
+pub struct ForwarderService {
+    pub server: SharedServer,
 }
 
 #[tonic::async_trait]
-impl Forwarder for ForwarderSvc {
+impl Forwarder for ForwarderService {
     type OpenStream = ReceiverStream<Result<ServerMsg, Status>>;
 
+    // --- Registration RPC ---
     async fn register(
         &self,
-        _req: Request<RegisterRequest>,
+        request: Request<RegisterRequest>,
     ) -> Result<Response<RegisterResponse>, Status> {
-        let id = 0;
-        Ok(Response::new(RegisterResponse { client_id: id }))
+        let req = request.into_inner();
+
+        // Create server↔client crossbeam channels
+        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<ServerMsg>();
+
+        // Allocate a new client ID atomically
+        let client_id = self
+            .server
+            .next_client_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        self.server.clients.insert(
+            client_id,
+            crate::server::ClientInfo {
+                step_participant: req.step_participant,
+                outbound_tx: outbound_tx.clone(),
+                outbound_rx: outbound_rx.clone(),
+            },
+        );
+
+        println!(
+            "[server] Registered remote client {} (step_participant={})",
+            client_id, req.step_participant
+        );
+
+        Ok(Response::new(RegisterResponse { client_id }))
     }
 
+    // --- Open bidirectional stream ---
     async fn open(
         &self,
-        req: Request<tonic::Streaming<ClientMsg>>,
+        request: Request<Streaming<ClientMsg>>,
     ) -> Result<Response<Self::OpenStream>, Status> {
-        let mut inbound = req.into_inner();
+        // Extract client ID from gRPC metadata
+        let md = request.metadata();
+        let client_id: u64 = md
+            .get("client-id")
+            .ok_or_else(|| Status::unauthenticated("missing client-id metadata"))?
+            .to_str()
+            .map_err(|_| Status::invalid_argument("invalid client-id metadata"))?
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid client-id number"))?;
 
-        let first = inbound
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("expected first message"))?;
-        let client_id = first.client_id.clone();
+        println!("[server] Remote client {} opened stream", client_id);
 
-        let client_rx = self.server.register_client(client_id.clone());
-        let inbound_tx = self.server.inbound_tx();
-        let server_clone = self.server.clone();
-        let cid_clone = client_id.clone();
+        // --- Inbound: client → server ---
+        let mut inbound = request.into_inner();
+        let inbound_tx = self.server.inbound_tx.clone();
+        let server_ref = self.server.clone();
 
-        // Forward inbound messages -> Server
+        // Spawn background task for inbound forwarding
         tokio::spawn(async move {
-            let _ = inbound_tx.send(first);
-            while let Ok(Some(msg)) = inbound.message().await.map_err(|_| ()) {
-                let _ = inbound_tx.send(msg);
+            while let Some(result) = inbound.next().await {
+                match result {
+                    Ok(msg) => {
+                        if inbound_tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        //eprintln!("[server] client {} stream error: {:?}", client_id, e);
+                        break;
+                    }
+                }
             }
-            server_clone.unregister_client(cid_clone);
+
+            // Unregister when client disconnects
+            println!(
+                "[server] Remote client {} disconnected (inbound)",
+                client_id
+            );
+            server_ref.clients.remove(&client_id);
         });
 
-        // Bridge crossbeam (blocking) -> async via tokio::mpsc
-        let (tx_async, rx_async) = tokio::sync::mpsc::channel::<Result<ServerMsg, Status>>(32);
+        // --- Outbound: server → client ---
+        let cb_rx: CbReceiver<ServerMsg> = match self.server.clients.get(&client_id) {
+            Some(entry) => entry.outbound_rx.clone(),
+            None => return Err(Status::not_found("client not registered")),
+        };
+
+        let (async_tx, async_rx) = tokio::sync::mpsc::channel::<Result<ServerMsg, Status>>(64);
+        let server_ref = self.server.clone();
+
         std::thread::spawn(move || {
-            for msg in client_rx.iter() {
-                let _ = tx_async.blocking_send(Ok(msg));
+            for msg in cb_rx.iter() {
+                if async_tx.blocking_send(Ok(msg)).is_err() {
+                    break;
+                }
             }
+
+            // Unregister client when stream closes
+            println!(
+                "[server] Remote client {} disconnected (outbound)",
+                client_id
+            );
+            server_ref.clients.remove(&client_id);
         });
 
-        Ok(Response::new(ReceiverStream::new(rx_async)))
+        Ok(Response::new(ReceiverStream::new(async_rx)))
     }
 }

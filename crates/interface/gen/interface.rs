@@ -117,7 +117,10 @@ pub mod server_msg {
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct RegisterRequest {}
+pub struct RegisterRequest {
+    #[prost(bool, tag = "1")]
+    pub step_participant: bool,
+}
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct RegisterResponse {
     #[prost(uint64, tag = "1")]

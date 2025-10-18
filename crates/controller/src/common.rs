@@ -4,10 +4,10 @@ use std::time::Duration;
 use anyhow::Result;
 use bridge::client::Client;
 
-pub fn spawn_controller_thread(
+pub fn spawn_controller_thread<C: Client>(
     cycles: usize,
     work_ms: u64,
-    sim: Client,
+    sim: C,
 ) -> thread::JoinHandle<Result<()>> {
     thread::spawn(move || -> Result<()> {
         for _ in 0..cycles {
