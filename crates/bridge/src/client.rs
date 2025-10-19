@@ -27,7 +27,8 @@ impl Client {
         step_participant: bool,
         server: &SharedServer<S>,
     ) -> Result<Self> {
-        let (client_id, to_server, from_server) = server.register_local_client(step_participant);
+        let (client_id, to_server, from_server) = server.register_client::<true>(step_participant);
+
         Ok(Self {
             step_participant,
             client_id,
@@ -39,16 +40,16 @@ impl Client {
     /// Connect to a **remote** gRPC server at the given address.
     ///
     /// You can pass either:
-    /// - `"127.0.0.1:50051"` → automatically becomes `"http://127.0.0.1:50051"`
-    /// - `"http://127.0.0.1:50051"` → used as is
+    /// - `"127.0.0.1:50051"` -> automatically becomes `"http://127.0.0.1:50051"`
+    /// - `"http://127.0.0.1:50051"` -> used as is
     /// Connect to a **remote** gRPC server at the given address
     /// Connect to a remote gRPC server and wait for registration.
     pub fn new_remote<StrType: Into<String>>(
         step_participant: bool,
         address: StrType,
     ) -> Result<Self> {
-        let (user_tx, user_rx) = unbounded::<ClientMsg>(); // user → server
-        let (srv_tx, srv_rx) = unbounded::<ServerMsg>(); // server → user
+        let (user_tx, user_rx) = unbounded::<ClientMsg>(); // user -> server
+        let (srv_tx, srv_rx) = unbounded::<ServerMsg>(); // server -> user
 
         let addr = address.into();
 
@@ -68,7 +69,7 @@ impl Client {
                     .await
                     .expect("connect failed");
 
-                // Register with the server → server assigns client_id
+                // Register with the server -> server assigns client_id
                 let resp = grpc
                     .register(Request::new(RegisterRequest { step_participant }))
                     .await
@@ -81,11 +82,10 @@ impl Client {
                 // Send client_id back to the blocking constructor
                 let _ = id_tx.send(client_id);
 
-                // Bridge: crossbeam user_rx → async mpsc
+                // Bridge: crossbeam user_rx -> async mpsc
                 let (tx_async, rx_async) = tokio::sync::mpsc::channel::<ClientMsg>(64);
-                let user_rx_clone = user_rx.clone();
                 std::thread::spawn(move || {
-                    for mut msg in user_rx_clone.iter() {
+                    for mut msg in user_rx.iter() {
                         msg.client_id = client_id;
                         if tx_async.blocking_send(msg).is_err() {
                             break;
@@ -106,7 +106,7 @@ impl Client {
                 // Open the bidirectional stream
                 let mut inbound = grpc.open(req).await.unwrap().into_inner();
 
-                // Bridge inbound messages (server → client)
+                // Bridge inbound messages (server -> client)
                 while let Some(result) = inbound.next().await {
                     match result {
                         Ok(msg) => {

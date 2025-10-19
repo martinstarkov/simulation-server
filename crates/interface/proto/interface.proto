@@ -28,7 +28,7 @@ message Object {
 message Vec3 { float x = 1; float y = 2; float z = 3; }
 message Quat { float x = 1; float y = 2; float z = 3; float w = 4; }
 
-// Controller → Simulator command (per-step inputs).
+// Controller -> Simulator command (per-step inputs).
 message ControlOutput {
   repeated ActuatorCmd actuators = 1;
 }

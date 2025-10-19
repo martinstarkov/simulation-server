@@ -1,6 +1,6 @@
 use crate::{safe_block_on, service::ForwarderService};
 use anyhow::Result;
-use crossbeam_channel::{Receiver as CbReceiver, RecvTimeoutError, Sender as CbSender, unbounded};
+use crossbeam_channel::{Receiver as CbReceiver, Select, Sender as CbSender};
 use dashmap::DashMap;
 use interface::{ClientMsg, ServerMsg, Simulation};
 use std::{
@@ -16,7 +16,16 @@ use std::{
 /// Internal info tracked for each registered client.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
+    /// True if this client participates in step barriers
     pub step_participant: bool,
+
+    /// Client -> server messages
+    // Needs to be None for local clients so that their disconnect (drop) can be detected by the server.
+    // If the server holds the channel, it never closes and so a local client will never fully disconnect.
+    pub inbound_tx: Option<CbSender<ClientMsg>>,
+    pub inbound_rx: CbReceiver<ClientMsg>,
+
+    /// Server -> client messages
     pub outbound_tx: CbSender<ServerMsg>,
     pub outbound_rx: CbReceiver<ServerMsg>,
 }
@@ -26,8 +35,6 @@ pub struct ClientInfo {
 pub struct Server<S: Simulation> {
     pub next_client_id: std::sync::atomic::AtomicU64,
 
-    pub inbound_tx: CbSender<ClientMsg>,
-    pub inbound_rx: CbReceiver<ClientMsg>,
     pub clients: DashMap<u64, ClientInfo>,
     pub sim: Arc<Mutex<S>>,
     shutdown_flag: Arc<AtomicBool>,
@@ -57,11 +64,8 @@ impl<S: Simulation> Server<S> {
 
     /// Create a new server and start the simulation (and optionally gRPC).
     pub fn new(mode: ServerMode, sim: S) -> (SharedServer<S>, JoinHandle<Result<()>>) {
-        let (in_tx, in_rx) = unbounded();
         let server = Arc::new(Self {
             next_client_id: std::sync::atomic::AtomicU64::new(1),
-            inbound_tx: in_tx,
-            inbound_rx: in_rx,
             clients: DashMap::new(),
             sim: Arc::new(Mutex::new(sim)),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
@@ -88,95 +92,138 @@ impl<S: Simulation> Server<S> {
         self.shutdown_flag.swap(true, Ordering::SeqCst);
     }
 
+    fn maybe_step_simulation(server: &Arc<Server<S>>, ready: &mut HashSet<u64>) {
+        let total: usize = server.clients.iter().filter(|c| c.step_participant).count();
+        ready.retain(|id| server.clients.contains_key(id));
+
+        if total > 0 && ready.len() == total {
+            println!(
+                "[server] all {} participants ready, stepping simulation",
+                total
+            );
+
+            if let Ok(mut sim) = server.sim.lock() {
+                if let Err(e) = sim.step() {
+                    eprintln!("Simulation step error: {e}");
+                }
+
+                let tick = sim.get_tick();
+                let msg = ServerMsg {
+                    body: Some(interface::server_msg::Body::Tick(tick)),
+                };
+
+                for entry in server.clients.iter() {
+                    let _ = entry.outbound_tx.send(msg.clone());
+                }
+                ready.clear();
+            }
+        }
+    }
+
     /// Start the synchronous simulation loop in a background thread.
-    fn start(self: &Arc<Self>) -> JoinHandle<Result<()>> {
+    pub fn start(self: &Arc<Self>) -> thread::JoinHandle<Result<()>> {
         let server = self.clone();
+
         thread::spawn(move || -> Result<()> {
             println!("[server] simulation loop started");
+
             let mut ready = HashSet::new();
+
+            // Cached state
+            let mut cached_client_ids: Vec<u64> = Vec::new();
+            let mut cached_receivers: Vec<CbReceiver<ClientMsg>> = Vec::new();
+            let mut select = Select::new();
 
             loop {
                 if server.shutdown_flag.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // Process incoming messages
-                let maybe_msg = match server.inbound_rx.recv_timeout(Duration::from_millis(1)) {
-                    Ok(msg) => Some(msg),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(_) => break,
-                };
+                // Collect and sort client IDs for stable ordering
+                let mut current_ids: Vec<u64> = server.clients.iter().map(|c| *c.key()).collect();
+                current_ids.sort_unstable();
 
-                if let Some(msg) = maybe_msg {
-                    match msg.body {
-                        Some(interface::client_msg::Body::Shutdown(_)) => {
-                            println!(
-                                "[server] received shutdown request from client {}",
-                                msg.client_id
-                            );
-                            break;
+                // Rebuild Select if clients changed
+                if current_ids != cached_client_ids {
+                    select = Select::new();
+                    cached_receivers.clear();
+
+                    for id in &current_ids {
+                        if let Some(info) = server.clients.get(id) {
+                            cached_receivers.push(info.inbound_rx.clone());
                         }
-                        Some(interface::client_msg::Body::StepReady(_)) => {
-                            ready.insert(msg.client_id);
-                            println!("[server] client {} ready", msg.client_id);
-                        }
-                        _ => {
-                            // Forward message to simulation
-                            if let Ok(mut sim) = server.sim.lock() {
-                                match sim.handle_message(msg) {
-                                    Ok(responses) => {
-                                        for entry in server.clients.iter() {
-                                            for msg in &responses {
-                                                let _ = entry.outbound_tx.send(msg.clone());
+                    }
+
+                    // Register all receivers *after* they are stored
+                    for rx in &cached_receivers {
+                        select.recv(rx);
+                    }
+
+                    cached_client_ids = current_ids;
+                    if !cached_receivers.is_empty() {
+                        println!(
+                            "[server] select rebuilt for {} clients",
+                            cached_receivers.len()
+                        );
+                    }
+                }
+
+                if cached_receivers.is_empty() {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+
+                // === Wait for any client message (timeout to allow stepping) ===
+                match select.select_timeout(Duration::from_millis(10)) {
+                    Ok(oper) => {
+                        let index = oper.index();
+                        let client_id = cached_client_ids[index];
+                        let rx = &cached_receivers[index];
+
+                        match oper.recv(rx) {
+                            Ok(msg) => match msg.body {
+                                Some(interface::client_msg::Body::Shutdown(_)) => {
+                                    println!("[server] client {} requested shutdown", client_id);
+                                    break;
+                                }
+                                Some(interface::client_msg::Body::StepReady(_)) => {
+                                    ready.insert(client_id);
+                                    println!("[server] client {} ready", client_id);
+                                }
+                                _ => {
+                                    if let Ok(mut sim) = server.sim.lock() {
+                                        if let Ok(responses) = sim.handle_message(msg) {
+                                            for entry in server.clients.iter() {
+                                                for msg in &responses {
+                                                    let _ = entry.outbound_tx.send(msg.clone());
+                                                }
                                             }
                                         }
                                     }
-                                    Err(e) => eprintln!("Simulation handle_message failed: {e}"),
                                 }
+                            },
+                            Err(_) => {
+                                println!("[server] client {} disconnected", client_id);
+                                server.unregister_client(client_id);
                             }
                         }
                     }
-                }
-
-                // Barrier: wait until all step participants are ready
-                let total: usize = server.clients.iter().filter(|c| c.step_participant).count();
-
-                ready.retain(|id| server.clients.contains_key(id));
-
-                if total > 0 && ready.len() == total {
-                    println!(
-                        "[server] all {} participants ready, stepping simulation",
-                        total
-                    );
-
-                    // Step simulation
-                    if let Ok(mut sim) = server.sim.lock() {
-                        if let Err(e) = sim.step() {
-                            eprintln!("Simulation step error: {e}");
+                    Err(_) => {
+                        // all receivers are gone
+                        if server.clients.is_empty() {
+                            println!("[server] all clients disconnected, shutting down");
+                            break;
                         }
-
-                        // Get the new tick info
-                        let tick = sim.get_tick();
-                        let msg = ServerMsg {
-                            body: Some(interface::server_msg::Body::Tick(tick)),
-                        };
-
-                        // Broadcast tick
-                        for entry in server.clients.iter() {
-                            let _ = entry.outbound_tx.send(msg.clone());
-                        }
-
-                        ready.clear();
                     }
-                } else {
-                    //println!("[server] {}/{} clients ready", ready.len(), total);
                 }
+
+                // === Check step barrier ===
+                Self::maybe_step_simulation(&server, &mut ready);
             }
 
+            // Cleanup
             server.clients.clear();
-
             println!("[server] shutdown");
-
             Ok(())
         })
     }
@@ -194,12 +241,12 @@ impl<S: Simulation> Server<S> {
         Ok(())
     }
 
-    pub fn register_local_client(
+    pub fn register_client<const LOCAL: bool>(
         self: &Arc<Self>,
         step_participant: bool,
     ) -> (u64, CbSender<ClientMsg>, CbReceiver<ServerMsg>) {
-        let (to_server_tx, to_server_rx) = unbounded::<ClientMsg>();
-        let (from_server_tx, from_server_rx) = unbounded::<ServerMsg>();
+        let (to_server_tx, to_server_rx) = crossbeam_channel::unbounded::<ClientMsg>();
+        let (from_server_tx, from_server_rx) = crossbeam_channel::unbounded::<ServerMsg>();
 
         let client_id = self
             .next_client_id
@@ -209,31 +256,17 @@ impl<S: Simulation> Server<S> {
             client_id,
             ClientInfo {
                 step_participant,
-                outbound_tx: from_server_tx.clone(),
+                inbound_tx: (!LOCAL).then_some(to_server_tx.clone()),
+                inbound_rx: to_server_rx,
+                outbound_tx: from_server_tx,
                 outbound_rx: from_server_rx.clone(),
             },
         );
 
-        let server_ref = self.clone();
-
-        // Spawn thread to forward from client → server inbound queue
-        let inbound_tx = self.inbound_tx.clone();
-        std::thread::spawn({
-            let inbound_tx = inbound_tx.clone();
-            move || {
-                for mut msg in to_server_rx.iter() {
-                    msg.client_id = client_id;
-                    if inbound_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-
-                println!("[server] Client {} disconnected", client_id);
-                server_ref.unregister_client(client_id);
-            }
-        });
-
-        println!("[server] Registered client {}", client_id);
+        println!(
+            "[server] registered client {} (step_participant={})",
+            client_id, step_participant
+        );
 
         (client_id, to_server_tx, from_server_rx)
     }

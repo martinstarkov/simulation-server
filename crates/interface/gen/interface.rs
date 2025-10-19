@@ -46,7 +46,7 @@ pub struct Quat {
     #[prost(float, tag = "4")]
     pub w: f32,
 }
-/// Controller → Simulator command (per-step inputs).
+/// Controller -> Simulator command (per-step inputs).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlOutput {
     #[prost(message, repeated, tag = "1")]
