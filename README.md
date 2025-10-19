@@ -1,135 +1,116 @@
-# 🧩 Simulator Framework
+# 🧩 Simulation Server Workspace
 
-A modular simulation system supporting **local**, **hybrid**, and **remote** execution modes — designed for distributed simulation, experimentation, and visualization.
+A modular **distributed simulation framework** built in Rust — supporting **local**, **hybrid**, and **remote** modes for simulation, coordination, and visualization.
 
 ---
 
 ## 🚀 Overview
 
-This simulator can run in multiple modes:
+This workspace is organized into multiple crates, each handling a distinct part of the system:
 
-| Mode | Description | Communication |
-|------|--------------|----------------|
-| **Local** | Fastest single-process setup. Simulator and client run in the same process using in-memory (Crossbeam) channels. | Crossbeam channels |
-| **Hybrid** | Local simulator with an exposed gRPC service endpoint, allowing external clients or visualizers to connect. | Crossbeam + gRPC |
-| **Remote** | Standalone gRPC simulator service, typically running on another machine. Remote clients and visualizers connect to it. | gRPC only |
+| Crate                                  | Role                    | Description                                            |
+| -------------------------------------- | ----------------------- | ------------------------------------------------------ |
+| 🧱 [`bridge`](./crates/bridge)         | Core networking layer   | Local + gRPC communication, client/server abstractions |
+| 🧩 [`controller`](./crates/controller) | Control interface       | Example binaries to launch servers and clients         |
+| 🔌 [`interface`](./crates/interface)   | Protocol definitions    | Protobuf + tonic-generated message types               |
+| 🧮 [`simulator`](./crates/simulator)   | Simulation core         | Simulation trait, ticking, and test implementations    |
+| 🎨 [`visualizer`](./crates/visualizer) | Visualization utilities | Example visualization clients (blocking/non-blocking)  |
+
+All crates live under the `crates/` directory and build together as a single Cargo workspace.
 
 ---
 
-## ⚙️ Setup
+## ⚙️ Building
 
-Ensure you have:
+Requires:
 
-- **Rust** ≥ 1.75 (`rustup install stable`)
-- **Tokio runtime**
-- **Protobuf / tonic** dependencies built (handled by `cargo build`)
+* **Rust** ≥ 1.90 (`rustup update`)
 
-Build everything:
+To build everything:
 
-```bash
-cargo build --workspace
+```
+cargo build
+```
+
+Run all tests:
+
+```
+cargo test
 ```
 
 ---
 
-## 🧠 Modes and Usage
+## 🧠 Architecture
 
-Below are all available configurations.
+The system supports three deployment modes:
 
----
-
-### 🧩 Option 1: Local Simulator
-
-Runs the simulator and client logic in one process — fastest configuration for testing or benchmarking.
-
-```bash
-cargo run -p sim-app --bin app -- --mode local --n-states 1000
-```
-
-- Uses only in-process channels (no gRPC).
-- Runs the simulation loop locally until the specified number of states are processed.
+| Mode       | Description                                                                           | Communication    |
+| ---------- | ------------------------------------------------------------------------------------- | ---------------- |
+| **Local**  | Single-process. The simulator and clients run together using fast in-memory channels. | Crossbeam        |
+| **Hybrid** | Local simulator with exposed gRPC endpoint for external clients.                      | Crossbeam + gRPC |
+| **Remote** | Full networked setup where the simulator runs remotely.                               | gRPC             |
 
 ---
 
-### 🔄 Option 2: Hybrid Simulator
+## 🧰 Running Examples
 
-Runs a local simulator **and** exposes a gRPC service endpoint so external tools (like a visualizer or remote clients) can connect.
+### 🧩 Local Simulation
 
-```bash
-cargo run -p sim-app --bin app -- --mode hybrid --addr 127.0.0.1:60000 --n-states 1000
+Everything runs in a single process — fastest mode for development.
+
+```
+cargo run -p controller --example local
 ```
 
-- Local client interacts with the simulator directly.
-- Other remote tools can connect at `127.0.0.1:60000`.
+### 🔄 Remote Server
 
-> 💡 Ideal for running local experiments while allowing external monitoring.
+Runs a server which exposes a gRPC endpoint for remote clients:
 
----
-
-### 🌐 Option 3: Remote Simulator Service
-
-Runs the simulator **as a standalone gRPC service**.  
-External clients or visualizers connect remotely to this address.
-
-```bash
-cargo run -p sim-app --bin sim_service -- --addr 127.0.0.1:60000
+```
+cargo run -p controller --example server
 ```
 
-- Does not run a local client — only the simulation backend.
-- Can be deployed remotely (e.g., in Docker or on another host).
+Then connect clients:
+
+```
+cargo run -p controller --example remote
+```
+
+Or visualizers:
+
+```
+cargo run -p visualizer --example remote_blocking
+```
+
+### 🌐 Remote Client and Server
+
+Run the server and client together remotely:
+
+```
+cargo run -p controller --example remote_with_server
+```
+
+Connect using a remote visualizer:
+
+```
+cargo run -p visualizer --example remote_blocking
+```
 
 ---
 
 ## 🖼️ Visualizer
 
-Connects to any simulator (hybrid or remote) to view simulation states.
+The visualizer can be run with a local server or by connecting to a remote server. Nonblocking means the server will not wait for the visualizer to finish rendering frames (may skip some simulation steps).
 
-### Remote Visualizer (non-blocking)
+Examples:
 
-Runs asynchronously and returns control after launch.
-
-```bash
-cargo run -p sim-remote-client -- --addr 127.0.0.1:60000 --n-states 1000 --app-id visualizer-1
 ```
-
-### Remote Visualizer (blocking)
-
-Waits for all states to be processed before exiting.
-
-```bash
-cargo run -p sim-remote-client -- --addr 127.0.0.1:60000 --n-states 1000 --app-id visualizer-1 --blocking
+cargo run -p visualizer --example local_blocking
+cargo run -p visualizer --example remote_blocking_with_server
+cargo run -p visualizer --example remote_blocking
+cargo run -p visualizer --example remote_nonblocking_with_server
+cargo run -p visualizer --example remote_nonblocking
 ```
-
-## 🧑‍💻 Clients
-
-Clients participate in the simulation by voting on steps or sending control commands.  
-Multiple clients can connect to the same simulator.
-
-### Remote Client 1
-
-```bash
-cargo run -p sim-app --bin app -- --mode remote --addr 127.0.0.1:60000 --n-states 1000 --app-id client-1
-```
-
-### Remote Client 2
-
-```bash
-cargo run -p sim-app --bin app -- --mode remote --addr 127.0.0.1:60000 --n-states 1000 --app-id client-2
-```
-
-> 💡 Each client has a unique `--app-id` so the simulator can track participants independently.
-
----
-
-## 🧭 Quick Reference
-
-| Role | Binary | Example Command |
-|------|---------|-----------------|
-| Local Simulator | `sim-app (bin app)` | `--mode local` |
-| Hybrid Simulator | `sim-app (bin app)` | `--mode hybrid --addr 127.0.0.1:60000` |
-| Remote Simulator | `sim-app (bin sim_service)` | `--addr 127.0.0.1:60000` |
-| Remote Client | `sim-app (bin app)` | `--mode remote --addr 127.0.0.1:60000` |
-| Visualizer | `sim-remote-client` | `--addr 127.0.0.1:60000` |
 
 ---
 
@@ -138,12 +119,12 @@ cargo run -p sim-app --bin app -- --mode remote --addr 127.0.0.1:60000 --n-state
 ```mermaid
 flowchart TD
     subgraph Remote
-        F[Remote Simulator] <-->|gRPC| G[Remote Visualizer / Remote Clients]
+        R1[Remote Simulator] <-->|gRPC| R2[Remote Clients / Visualizers]
     end
 
     subgraph Hybrid
-        C[Local Client] <-->|Crossbeam| D[Local Simulator]
-        D <-->|gRPC| E[Remote Visualizer / Remote Clients]
+        L1[Local Client] <-->|Crossbeam| L2[Local Simulator]
+        L2 <-->|gRPC| R2
     end
 
     subgraph Local
@@ -153,5 +134,5 @@ flowchart TD
 
 ## 📜 License
 
-MIT License © 2025  
-Developed for distributed simulation research and experimentation.
+MIT License © 2025
+Developed as a template for distributed simulation.
