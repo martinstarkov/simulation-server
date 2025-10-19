@@ -2,8 +2,7 @@
 members = [
   "crates/simulator",
   "crates/interface",
-  "crates/client",
-  "crates/server",
+  "crates/bridge",
   "crates/controller",
   "crates/visualizer",
 ]
@@ -15,7 +14,7 @@ rust-version = "1.90.0"
 
 [workspace.dependencies]
 anyhow = "1"
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.15"
 futures = "0.3"
 prost = "0.13"
 prost-types = "0.13"
@@ -26,8 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 interface = { path = "crates/interface" }
 simulator = { path = "crates/simulator" }
-client = { path = "crates/client" }
-server = { path = "crates/server" }
+bridge = { path = "crates/bridge" }
 
 # Enable a small amount of optimization in the dev profile.
 [profile.dev]

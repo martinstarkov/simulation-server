@@ -9,5 +9,5 @@ publish = false
 [dependencies]
 anyhow = { workspace = true }
 interface = { workspace = true }
-client = { workspace = true }
-server = { workspace = true }
+bridge = { workspace = true }
+simulator = { workspace = true }

@@ -4,18 +4,18 @@ use anyhow::Result;
 use interface::{ClientMsg, ErrorMsg, ServerMsg, ServerMsgBody, Simulation, Tick};
 
 #[derive(Default)]
-pub struct MySim {
+pub struct TestSim {
     seq: u64,
     time_s: f32,
 }
 
-impl MySim {
+impl TestSim {
     fn dt(&self) -> f32 {
         1.0 / 60.0
     }
 }
 
-impl Simulation for MySim {
+impl Simulation for TestSim {
     fn handle_message(&mut self, msg: ClientMsg) -> Result<Vec<ServerMsg>> {
         Ok(vec![ServerMsg {
             body: Some(ServerMsgBody::ErrorMsg(ErrorMsg {
