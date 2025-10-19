@@ -1,0 +1,13 @@
+[package]
+name = "controller"
+authors = ["Martin Starkov"]
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+interface = { workspace = true }
+bridge = { workspace = true }
+simulator = { workspace = true }
